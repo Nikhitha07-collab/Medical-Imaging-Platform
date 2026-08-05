@@ -1,0 +1,49 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment and secret files
+.env
+.env.*
+secrets.toml
+
+# Streamlit local configuration
+.streamlit/secrets.toml
+
+# DICOM and local test data
+test_data/
+*.dcm
+*.dicom
+
+# Large model files
+*.h5
+*.keras
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE files
+.vscode/
+.idea/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+
+# Temporary and log files
+*.log
+*.tmp
