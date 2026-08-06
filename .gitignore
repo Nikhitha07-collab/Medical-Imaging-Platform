@@ -47,3 +47,5 @@ Thumbs.db
 # Temporary and log files
 *.log
 *.tmp
+# Temporary uploaded medical images
+uploaded_data/
