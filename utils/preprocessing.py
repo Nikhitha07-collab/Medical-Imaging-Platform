@@ -2,59 +2,72 @@ import numpy as np
 from pydicom.dataset import FileDataset
 
 
-def get_pixel_array(dataset: FileDataset) -> np.ndarray:
-    """Decode DICOM PixelData into a NumPy array."""
+def get_number_of_frames(dataset: FileDataset) -> int:
+    """Return the number of frames in a DICOM dataset."""
 
     try:
-        image = dataset.pixel_array
+        return max(
+            int(getattr(dataset, "NumberOfFrames", 1) or 1),
+            1,
+        )
+    except (TypeError, ValueError):
+        return 1
+
+
+def get_pixel_array(dataset: FileDataset) -> np.ndarray:
+    """Decode all DICOM pixel data."""
+
+    try:
+        return np.asarray(dataset.pixel_array)
     except Exception as error:
         raise ValueError(
             f"Unable to decode DICOM pixel data: {error}"
         ) from error
 
-    image = np.asarray(image)
 
-    number_of_frames = int(
-        getattr(dataset, "NumberOfFrames", 1)
-    )
+def get_frame(
+    dataset: FileDataset,
+    frame_index: int = 0,
+) -> np.ndarray:
+    """Return one frame from a single-frame or multi-frame DICOM."""
 
+    pixel_array = get_pixel_array(dataset)
+
+    number_of_frames = get_number_of_frames(dataset)
     samples_per_pixel = int(
-        getattr(dataset, "SamplesPerPixel", 1)
+        getattr(dataset, "SamplesPerPixel", 1) or 1
     )
 
-    # Multi-frame grayscale DICOM:
-    # (frames, rows, columns)
-    if (
-        number_of_frames > 1
-        and samples_per_pixel == 1
-        and image.ndim >= 3
-    ):
-        image = image[0]
+    if number_of_frames <= 1:
+        return pixel_array
 
-    # Multi-frame color DICOM:
-    # (frames, rows, columns, channels)
-    if (
-        number_of_frames > 1
-        and samples_per_pixel > 1
-        and image.ndim == 4
-    ):
-        image = image[0]
+    frame_index = max(
+        0,
+        min(frame_index, number_of_frames - 1),
+    )
 
-    return image
+    if samples_per_pixel == 1:
+        # Shape usually:
+        # frames, rows, columns
+        return pixel_array[frame_index]
+
+    # Color multi-frame:
+    # frames, rows, columns, channels
+    return pixel_array[frame_index]
 
 
 def apply_modality_rescale(
     image: np.ndarray,
     dataset: FileDataset,
 ) -> np.ndarray:
-    """Apply DICOM rescale slope and intercept."""
+    """Apply DICOM RescaleSlope and RescaleIntercept."""
 
     slope = float(
-        getattr(dataset, "RescaleSlope", 1.0)
+        getattr(dataset, "RescaleSlope", 1.0) or 1.0
     )
 
     intercept = float(
-        getattr(dataset, "RescaleIntercept", 0.0)
+        getattr(dataset, "RescaleIntercept", 0.0) or 0.0
     )
 
     return (
@@ -66,7 +79,7 @@ def apply_modality_rescale(
 def normalize_image(
     image: np.ndarray,
 ) -> np.ndarray:
-    """Normalize image intensity into the 0-255 range."""
+    """Normalize an image into the 0-255 display range."""
 
     image = image.astype(np.float32)
 
@@ -102,15 +115,8 @@ def apply_window(
             "Window Width must be greater than zero."
         )
 
-    lower = (
-        window_center
-        - window_width / 2.0
-    )
-
-    upper = (
-        window_center
-        + window_width / 2.0
-    )
+    lower = window_center - window_width / 2.0
+    upper = window_center + window_width / 2.0
 
     windowed = np.clip(
         image,
@@ -131,12 +137,16 @@ def apply_window(
 
 def dicom_to_image(
     dataset: FileDataset,
+    frame_index: int = 0,
     window_center: float | None = None,
     window_width: float | None = None,
 ) -> np.ndarray:
-    """Convert a DICOM dataset into a display-ready image."""
+    """Convert one DICOM frame into a display-ready image."""
 
-    image = get_pixel_array(dataset)
+    image = get_frame(
+        dataset,
+        frame_index=frame_index,
+    )
 
     photometric = str(
         getattr(
@@ -147,11 +157,7 @@ def dicom_to_image(
     ).upper()
 
     samples_per_pixel = int(
-        getattr(
-            dataset,
-            "SamplesPerPixel",
-            1,
-        )
+        getattr(dataset, "SamplesPerPixel", 1) or 1
     )
 
     is_color = (
@@ -160,14 +166,12 @@ def dicom_to_image(
         or photometric.startswith("YBR")
     )
 
-    # Color Ultrasound or other RGB DICOM
     if is_color:
         if image.dtype != np.uint8:
             image = normalize_image(image)
 
         return image.astype(np.uint8)
 
-    # Grayscale CT/MRI/Ultrasound
     image = apply_modality_rescale(
         image,
         dataset,
@@ -182,17 +186,11 @@ def dicom_to_image(
             window_center,
             window_width,
         )
-
     else:
-        display_image = normalize_image(
-            image
-        )
+        display_image = normalize_image(image)
 
-    # MONOCHROME1 means low values should appear white.
     if photometric == "MONOCHROME1":
-        display_image = (
-            255 - display_image
-        )
+        display_image = 255 - display_image
 
     return display_image.astype(np.uint8)
 
@@ -202,11 +200,9 @@ def adjust_brightness_contrast(
     brightness: int = 0,
     contrast: float = 1.0,
 ) -> np.ndarray:
-    """Apply display brightness and contrast."""
+    """Apply brightness and contrast."""
 
-    adjusted = image.astype(
-        np.float32
-    )
+    adjusted = image.astype(np.float32)
 
     adjusted = (
         adjusted * contrast

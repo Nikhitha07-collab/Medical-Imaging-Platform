@@ -13,154 +13,91 @@ from utils.preprocessing import (
 )
 from utils.upload_handler import (
     UPLOAD_FOLDER,
-    detect_modality,
     find_dicom_files,
+    group_dicom_series,
     prepare_upload_folder,
 )
 
 
 PROJECT_TITLE = "Medical Imaging Platform"
 
-
-MODALITY_FOLDERS: dict[str, Path] = {
-    "CT": Path(
-        "test_data/CT/chest_ct/27548"
-    ),
-    "MRI": Path(
-        "test_data/MRI/abdomen_mri/80231"
-    ),
-    "Ultrasound": Path(
-        "test_data/Ultrasound/"
-        "thyroid_us/46711"
-    ),
+MODALITY_FOLDERS = {
+    "CT": Path("test_data/CT/chest_ct/27548"),
+    "MRI": Path("test_data/MRI/abdomen_mri/80231"),
+    "Ultrasound": Path("test_data/Ultrasound/thyroid_us/46711"),
 }
 
-
-CT_WINDOW_PRESETS: dict[
-    str,
-    tuple[float, float],
-] = {
-    "Lung": (
-        -600.0,
-        1500.0,
-    ),
-    "Soft Tissue": (
-        40.0,
-        400.0,
-    ),
-    "Bone": (
-        300.0,
-        1500.0,
-    ),
-    "Brain": (
-        40.0,
-        80.0,
-    ),
+CT_WINDOW_PRESETS = {
+    "Lung": (-600.0, 1500.0),
+    "Soft Tissue": (40.0, 400.0),
+    "Bone": (300.0, 1500.0),
+    "Brain": (40.0, 80.0),
 }
 
 
 current_files: list[Path] = []
-
 current_modality = "CT"
-
 current_slice_index = 0
-
-uploaded_file_count = 0
-
 current_zoom = 1.0
-
+current_rotation = 0
+flip_horizontal = False
+flip_vertical = False
 current_source = "Sample CT"
 
+uploaded_file_count = 0
+uploaded_series: dict[str, dict] = {}
+series_display_map: dict[str, str] = {}
 
-def image_to_data_url(
-    image_array,
-) -> str:
-    """Convert a NumPy image into a PNG data URL."""
 
-    image = Image.fromarray(
-        image_array
-    )
-
+def image_to_data_url(image_array) -> str:
+    image = Image.fromarray(image_array)
     buffer = BytesIO()
-
-    image.save(
-        buffer,
-        format="PNG",
-    )
+    image.save(buffer, format="PNG")
 
     encoded = b64encode(
         buffer.getvalue()
-    ).decode(
-        "utf-8"
-    )
+    ).decode("utf-8")
 
-    return (
-        "data:image/png;base64,"
-        f"{encoded}"
-    )
+    return f"data:image/png;base64,{encoded}"
 
 
-def safe_value(
-    dataset: Any,
-    attribute: str,
-) -> str:
-    """Read a safe DICOM metadata value."""
-
+def safe_value(dataset: Any, attribute: str) -> str:
     value = getattr(
         dataset,
         attribute,
         "Not available",
     )
 
-    if value in (
-        None,
-        "",
-    ):
+    if value in (None, ""):
         return "Not available"
 
     return str(value)
 
 
-def get_transfer_syntax(
-    dataset: Any,
-) -> str:
-    """Read Transfer Syntax UID safely."""
-
+def get_transfer_syntax(dataset: Any) -> str:
     try:
-        value = (
-            dataset.file_meta
-            .TransferSyntaxUID
+        return str(
+            dataset.file_meta.TransferSyntaxUID
         )
-
-        return str(value)
-
     except Exception:
         return "Not available"
 
 
-def update_metadata(
-    dataset: Any,
-) -> None:
-    """Update safe DICOM metadata."""
-
+def update_metadata(dataset: Any) -> None:
     modality_label.set_text(
-        "Modality: "
-        f"{safe_value(dataset, 'Modality')}"
+        f"Modality: {safe_value(dataset, 'Modality')}"
     )
 
     manufacturer_label.set_text(
-        "Manufacturer: "
-        f"{safe_value(dataset, 'Manufacturer')}"
+        f"Manufacturer: {safe_value(dataset, 'Manufacturer')}"
     )
 
     model_label.set_text(
-        "Model: "
-        f"{safe_value(dataset, 'ManufacturerModelName')}"
+        f"Model: {safe_value(dataset, 'ManufacturerModelName')}"
     )
 
     study_date_label.set_text(
-        "Study Date: "
-        f"{safe_value(dataset, 'StudyDate')}"
+        f"Study Date: {safe_value(dataset, 'StudyDate')}"
     )
 
     series_label.set_text(
@@ -169,14 +106,12 @@ def update_metadata(
     )
 
     body_part_label.set_text(
-        "Body Part: "
-        f"{safe_value(dataset, 'BodyPartExamined')}"
+        f"Body Part: {safe_value(dataset, 'BodyPartExamined')}"
     )
 
     dimensions_label.set_text(
         "Dimensions: "
-        f"{safe_value(dataset, 'Rows')}"
-        " × "
+        f"{safe_value(dataset, 'Rows')} × "
         f"{safe_value(dataset, 'Columns')}"
     )
 
@@ -191,28 +126,23 @@ def update_metadata(
     )
 
     pixel_spacing_label.set_text(
-        "Pixel Spacing: "
-        f"{safe_value(dataset, 'PixelSpacing')}"
+        f"Pixel Spacing: {safe_value(dataset, 'PixelSpacing')}"
     )
 
     slice_thickness_label.set_text(
-        "Slice Thickness: "
-        f"{safe_value(dataset, 'SliceThickness')}"
+        f"Slice Thickness: {safe_value(dataset, 'SliceThickness')}"
     )
 
     window_center_label.set_text(
-        "Window Center: "
-        f"{safe_value(dataset, 'WindowCenter')}"
+        f"Window Center: {safe_value(dataset, 'WindowCenter')}"
     )
 
     window_width_label.set_text(
-        "Window Width: "
-        f"{safe_value(dataset, 'WindowWidth')}"
+        f"Window Width: {safe_value(dataset, 'WindowWidth')}"
     )
 
     sop_class_label.set_text(
-        "SOP Class UID: "
-        f"{safe_value(dataset, 'SOPClassUID')}"
+        f"SOP Class UID: {safe_value(dataset, 'SOPClassUID')}"
     )
 
     study_uid_label.set_text(
@@ -226,73 +156,59 @@ def update_metadata(
     )
 
     transfer_syntax_label.set_text(
-        "Transfer Syntax UID: "
-        f"{get_transfer_syntax(dataset)}"
+        f"Transfer Syntax UID: {get_transfer_syntax(dataset)}"
     )
 
 
-def get_current_window(
-) -> tuple[
-    float | None,
-    float | None,
-]:
-    """Get current CT window values."""
-
+def get_current_window():
     if current_modality != "CT":
-        return (
-            None,
-            None,
-        )
+        return None, None
 
     try:
         center = float(
-            window_center_input.value
-            or 40
+            window_center_input.value or 40
         )
 
         width = float(
-            window_width_input.value
-            or 400
+            window_width_input.value or 400
         )
 
-    except (
-        TypeError,
-        ValueError,
-    ):
-        return (
-            40.0,
-            400.0,
-        )
+    except (TypeError, ValueError):
+        return 40.0, 400.0
 
     if width <= 0:
         width = 1.0
 
-    return (
-        center,
-        width,
-    )
+    return center, width
 
 
-def apply_zoom() -> None:
-    """Apply image zoom."""
+def apply_view_transform() -> None:
+    scale_x = -1 if flip_horizontal else 1
+    scale_y = -1 if flip_vertical else 1
 
-    zoom_percent = int(
-        current_zoom * 100
-    )
-
-    zoom_label.set_text(
-        f"Zoom: {zoom_percent}%"
+    transform = (
+        f"scale({current_zoom}) "
+        f"rotate({current_rotation}deg) "
+        f"scaleX({scale_x}) "
+        f"scaleY({scale_y})"
     )
 
     dicom_image.style(
-        f"transform: scale({current_zoom}); "
-        "transform-origin: center center;"
+        f"transform: {transform}; "
+        "transform-origin: center center; "
+        "transition: transform 0.15s ease;"
+    )
+
+    zoom_label.set_text(
+        f"Zoom: {int(current_zoom * 100)}%"
+    )
+
+    rotation_label.set_text(
+        f"Rotation: {current_rotation}°"
     )
 
 
 def zoom_in() -> None:
-    """Zoom into the image."""
-
     global current_zoom
 
     current_zoom = min(
@@ -300,12 +216,10 @@ def zoom_in() -> None:
         3.0,
     )
 
-    apply_zoom()
+    apply_view_transform()
 
 
 def zoom_out() -> None:
-    """Zoom out of the image."""
-
     global current_zoom
 
     current_zoom = max(
@@ -313,24 +227,79 @@ def zoom_out() -> None:
         0.5,
     )
 
-    apply_zoom()
+    apply_view_transform()
 
 
 def fit_to_screen() -> None:
-    """Reset zoom to 100 percent."""
-
     global current_zoom
 
     current_zoom = 1.0
 
-    apply_zoom()
+    apply_view_transform()
 
 
-def load_slice(
-    index: int | float,
-) -> None:
-    """Load and display one DICOM image."""
+def rotate_left() -> None:
+    global current_rotation
 
+    current_rotation = (
+        current_rotation - 90
+    ) % 360
+
+    apply_view_transform()
+
+
+def rotate_right() -> None:
+    global current_rotation
+
+    current_rotation = (
+        current_rotation + 90
+    ) % 360
+
+    apply_view_transform()
+
+
+def toggle_flip_horizontal() -> None:
+    global flip_horizontal
+
+    flip_horizontal = not flip_horizontal
+
+    apply_view_transform()
+
+
+def toggle_flip_vertical() -> None:
+    global flip_vertical
+
+    flip_vertical = not flip_vertical
+
+    apply_view_transform()
+
+
+async def enter_fullscreen() -> None:
+    await ui.run_javascript(
+        """
+        const element = document.querySelector('.viewer-frame');
+        if (element && element.requestFullscreen) {
+            element.requestFullscreen();
+        }
+        """
+    )
+
+
+def reset_view() -> None:
+    global current_zoom
+    global current_rotation
+    global flip_horizontal
+    global flip_vertical
+
+    current_zoom = 1.0
+    current_rotation = 0
+    flip_horizontal = False
+    flip_vertical = False
+
+    apply_view_transform()
+
+
+def load_slice(index: int | float) -> None:
     global current_slice_index
 
     if not current_files:
@@ -348,25 +317,17 @@ def load_slice(
         ),
     )
 
-    current_slice_index = (
-        selected_index
-    )
-
-    selected_file = (
-        current_files[
-            selected_index
-        ]
-    )
+    current_slice_index = selected_index
+    selected_file = current_files[selected_index]
 
     try:
         dataset = load_dicom(
             selected_file
         )
 
-        (
-            window_center,
-            window_width,
-        ) = get_current_window()
+        window_center, window_width = (
+            get_current_window()
+        )
 
         base_image = dicom_to_image(
             dataset,
@@ -376,14 +337,12 @@ def load_slice(
 
         brightness = int(
             float(
-                brightness_slider.value
-                or 0
+                brightness_slider.value or 0
             )
         )
 
         contrast = float(
-            contrast_slider.value
-            or 1.0
+            contrast_slider.value or 1.0
         )
 
         processed_image = (
@@ -409,6 +368,14 @@ def load_slice(
             f"of {len(current_files)}"
         )
 
+        file_name_label.set_text(
+            f"File: {selected_file.name}"
+        )
+
+        current_study_label.set_text(
+            f"Current Study: {current_source}"
+        )
+
         brightness_label.set_text(
             f"Brightness: {brightness}"
         )
@@ -417,47 +384,27 @@ def load_slice(
             f"Contrast: {contrast:.2f}"
         )
 
-        file_name_label.set_text(
-            f"File: {selected_file.name}"
-        )
-
         viewer_status_label.set_text(
             f"Loaded {selected_file.name}"
         )
 
-        current_study_label.set_text(
-            f"Current Study: {current_source}"
-        )
-
-        update_metadata(
-            dataset
-        )
+        update_metadata(dataset)
 
     except Exception as error:
-
-        viewer_status_label.set_text(
-            "Unable to display image"
-        )
-
         ui.notify(
-            "Unable to load DICOM image: "
-            f"{error}",
+            f"Unable to load DICOM image: {error}",
             type="negative",
             position="top",
         )
 
 
 def refresh_image() -> None:
-    """Refresh the active image."""
-
     load_slice(
         current_slice_index
     )
 
 
 def set_window_visibility() -> None:
-    """Show window controls for CT only."""
-
     window_panel.set_visibility(
         current_modality == "CT"
     )
@@ -468,143 +415,87 @@ def configure_study(
     modality: str,
     source: str,
 ) -> None:
-    """Configure viewer for a study."""
-
     global current_files
     global current_modality
     global current_slice_index
-    global current_zoom
     global current_source
 
     current_files = files
-
     current_modality = modality
-
     current_slice_index = 0
-
-    current_zoom = 1.0
-
     current_source = source
 
     slice_slider.min = 0
-
     slice_slider.max = max(
-        len(current_files) - 1,
+        len(files) - 1,
         0,
     )
-
     slice_slider.value = 0
-
     slice_slider.update()
 
     brightness_slider.value = 0
-
     brightness_slider.update()
 
     contrast_slider.value = 1.0
-
     contrast_slider.update()
 
     if modality == "CT":
-
         window_center_input.value = 40
-
-        window_center_input.update()
-
         window_width_input.value = 400
 
+        window_center_input.update()
         window_width_input.update()
 
     set_window_visibility()
-
-    apply_zoom()
-
+    reset_view()
     load_slice(0)
 
 
-def change_modality(
-    event,
-) -> None:
-    """Load included sample data."""
-
+def change_modality(event) -> None:
     selected_modality = str(
         event.value
     )
 
-    if (
-        selected_modality
-        not in MODALITY_FOLDERS
-    ):
+    if selected_modality not in MODALITY_FOLDERS:
         return
 
-    selected_folder = (
+    files = find_dicom_files(
         MODALITY_FOLDERS[
             selected_modality
         ]
     )
 
-    files = find_dicom_files(
-        selected_folder
-    )
-
     if not files:
-
         ui.notify(
-            "No valid DICOM files found in "
-            f"{selected_folder}",
+            "No valid DICOM files found.",
             type="negative",
-            position="top",
         )
-
         return
 
     configure_study(
-        files=files,
-        modality=selected_modality,
-        source=(
-            f"Sample {selected_modality}"
-        ),
-    )
-
-    ui.notify(
-        f"{selected_modality} "
-        "sample study loaded",
-        type="positive",
-        position="top",
+        files,
+        selected_modality,
+        f"Sample {selected_modality}",
     )
 
 
-def change_slice(
-    event,
-) -> None:
-    """Handle slice changes."""
-
+def change_slice(event) -> None:
     load_slice(
         event.value
     )
 
 
-def change_brightness(
-    event,
-) -> None:
-    """Handle brightness changes."""
-
+def change_brightness(event) -> None:
     brightness_label.set_text(
-        "Brightness: "
-        f"{int(float(event.value))}"
+        f"Brightness: {int(float(event.value))}"
     )
 
     refresh_image()
 
 
-def change_contrast(
-    event,
-) -> None:
-    """Handle contrast changes."""
-
+def change_contrast(event) -> None:
     contrast_label.set_text(
-        "Contrast: "
-        f"{float(event.value):.2f}"
+        f"Contrast: {float(event.value):.2f}"
     )
 
     refresh_image()
@@ -613,17 +504,7 @@ def change_contrast(
 def apply_window_preset(
     preset_name: str,
 ) -> None:
-    """Apply a CT window preset."""
-
     if current_modality != "CT":
-
-        ui.notify(
-            "Window presets are available "
-            "only for CT studies.",
-            type="warning",
-            position="top",
-        )
-
         return
 
     center, width = (
@@ -632,153 +513,51 @@ def apply_window_preset(
         ]
     )
 
-    window_center_input.value = (
-        center
-    )
+    window_center_input.value = center
+    window_width_input.value = width
 
     window_center_input.update()
-
-    window_width_input.value = (
-        width
-    )
-
     window_width_input.update()
 
     refresh_image()
 
-    ui.notify(
-        f"{preset_name} window applied",
-        type="info",
-        position="top",
-    )
-
 
 def apply_custom_window() -> None:
-    """Apply custom CT window values."""
-
     if current_modality != "CT":
-
-        ui.notify(
-            "Custom windowing is available "
-            "only for CT studies.",
-            type="warning",
-            position="top",
-        )
-
-        return
-
-    try:
-        width = float(
-            window_width_input.value
-        )
-
-        float(
-            window_center_input.value
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        ui.notify(
-            "Enter valid window values.",
-            type="negative",
-            position="top",
-        )
-
-        return
-
-    if width <= 0:
-
-        ui.notify(
-            "Window Width must be "
-            "greater than zero.",
-            type="negative",
-            position="top",
-        )
-
         return
 
     refresh_image()
 
-    ui.notify(
-        "Custom CT window applied",
-        type="info",
-        position="top",
-    )
 
-
-def reset_controls(
-    show_notification: bool = True,
-) -> None:
-    """Reset all viewer controls."""
-
-    global current_zoom
-
+def reset_controls() -> None:
     brightness_slider.value = 0
-
-    brightness_slider.update()
-
     contrast_slider.value = 1.0
 
+    brightness_slider.update()
     contrast_slider.update()
 
-    current_zoom = 1.0
-
-    apply_zoom()
-
     if current_modality == "CT":
-
         window_center_input.value = 40
-
-        window_center_input.update()
-
         window_width_input.value = 400
 
+        window_center_input.update()
         window_width_input.update()
 
-    if current_files:
-        refresh_image()
-
-    if show_notification:
-
-        ui.notify(
-            "Viewer controls reset",
-            type="info",
-            position="top",
-        )
+    reset_view()
+    refresh_image()
 
 
 async def handle_dicom_upload(
     event: events.UploadEventArguments,
 ) -> None:
-    """Save one uploaded DICOM file."""
-
     global uploaded_file_count
 
-    UPLOAD_FOLDER.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    safe_file_name = Path(
+    safe_name = Path(
         event.file.name
     ).name
 
-    if not safe_file_name:
-
-        ui.notify(
-            "Invalid uploaded filename.",
-            type="negative",
-            position="top",
-        )
-
-        return
-
     destination = (
-        UPLOAD_FOLDER
-        / safe_file_name
+        UPLOAD_FOLDER / safe_name
     )
 
     try:
@@ -789,103 +568,113 @@ async def handle_dicom_upload(
         uploaded_file_count += 1
 
         upload_status_label.set_text(
-            "Uploaded files: "
-            f"{uploaded_file_count}"
+            f"Uploaded files: {uploaded_file_count}"
         )
 
     except Exception as error:
-
         ui.notify(
-            "Unable to save "
-            f"{safe_file_name}: {error}",
+            f"Upload failed: {error}",
             type="negative",
-            position="top",
         )
 
 
-def load_uploaded_study() -> None:
-    """Load uploaded DICOM study."""
+def analyze_uploaded_files() -> None:
+    global uploaded_series
+    global series_display_map
 
-    uploaded_files = (
-        find_dicom_files(
-            UPLOAD_FOLDER
-        )
+    files = find_dicom_files(
+        UPLOAD_FOLDER
     )
 
-    if not uploaded_files:
-
+    if not files:
         ui.notify(
-            "No valid uploaded DICOM "
-            "files were found.",
+            "No valid uploaded DICOM files found.",
             type="negative",
-            position="top",
         )
-
         return
 
-    try:
-        detected_modality = (
-            detect_modality(
-                uploaded_files[0]
-            )
-        )
+    uploaded_series = (
+        group_dicom_series(files)
+    )
 
-        configure_study(
-            files=uploaded_files,
-            modality=detected_modality,
-            source=(
-                "Uploaded "
-                f"{detected_modality}"
-            ),
-        )
+    series_display_map = {
+        data["display_name"]: uid
+        for uid, data
+        in uploaded_series.items()
+    }
 
+    uploaded_series_selector.options = list(
+        series_display_map.keys()
+    )
+
+    uploaded_series_selector.value = None
+    uploaded_series_selector.update()
+
+    series_status_label.set_text(
+        f"Detected series: {len(uploaded_series)}"
+    )
+
+
+def load_selected_uploaded_series() -> None:
+    selected_display = (
+        uploaded_series_selector.value
+    )
+
+    if not selected_display:
         ui.notify(
-            "Uploaded "
-            f"{detected_modality} "
-            "study loaded",
-            type="positive",
-            position="top",
+            "Select an uploaded series first.",
+            type="warning",
         )
+        return
 
-    except Exception as error:
+    series_uid = (
+        series_display_map[
+            selected_display
+        ]
+    )
 
-        ui.notify(
-            "Unable to load uploaded "
-            f"study: {error}",
-            type="negative",
-            position="top",
-        )
+    series = (
+        uploaded_series[
+            series_uid
+        ]
+    )
+
+    configure_study(
+        files=series["files"],
+        modality=series["modality"],
+        source=series["display_name"],
+    )
 
 
 def clear_uploaded_study() -> None:
-    """Clear temporary uploads."""
-
     global uploaded_file_count
+    global uploaded_series
+    global series_display_map
 
     prepare_upload_folder()
 
     uploaded_file_count = 0
+    uploaded_series = {}
+    series_display_map = {}
 
     upload_status_label.set_text(
         "Uploaded files: 0"
     )
 
-    upload_control.reset()
-
-    ui.notify(
-        "Uploaded files cleared",
-        type="info",
-        position="top",
+    series_status_label.set_text(
+        "Detected series: 0"
     )
+
+    uploaded_series_selector.options = []
+    uploaded_series_selector.value = None
+    uploaded_series_selector.update()
+
+    upload_control.reset()
 
 
 prepare_upload_folder()
 
-
-ui.page_title(
-    PROJECT_TITLE
-)
-
+ui.page_title(PROJECT_TITLE)
 
 ui.add_css(
     """
@@ -893,26 +682,38 @@ ui.add_css(
         background: #f8fafc;
     }
 
-    .viewer-image img {
-        object-fit: contain;
-        max-height: 720px;
-        background: black;
-    }
-
     .viewer-frame {
         overflow: auto;
         min-height: 500px;
         max-height: 780px;
         width: 100%;
-        background: #000000;
+        background: black;
         display: flex;
-        align-items: center;
         justify-content: center;
+        align-items: center;
         border-radius: 10px;
+        position: relative;
+    }
+
+    .viewer-frame:fullscreen {
+        width: 100vw;
+        height: 100vh;
+        max-height: none;
+        background: black;
+    }
+
+    .viewer-image img {
+        object-fit: contain;
+        max-height: 720px;
+        user-select: none;
+    }
+
+    .viewer-frame:fullscreen .viewer-image img {
+        max-height: 95vh;
     }
 
     .control-panel {
-        min-width: 310px;
+        min-width: 320px;
     }
 
     .metadata-panel {
@@ -926,7 +727,6 @@ with ui.header().classes(
     "items-center justify-between "
     "bg-slate-900 text-white px-6"
 ):
-
     ui.label(
         PROJECT_TITLE
     ).classes(
@@ -935,21 +735,16 @@ with ui.header().classes(
 
     ui.label(
         "CT • MRI • Ultrasound"
-    ).classes(
-        "text-sm"
     )
 
 
 with ui.row().classes(
-    "w-full no-wrap gap-6 "
-    "p-6 items-start"
+    "w-full no-wrap gap-6 p-6 items-start"
 ):
 
-    # LEFT CONTROL PANEL
     with ui.column().classes(
-        "control-panel w-72 "
-        "bg-slate-100 rounded-lg "
-        "p-4 shadow"
+        "control-panel w-80 "
+        "bg-slate-100 rounded-lg p-4 shadow"
     ):
 
         ui.label(
@@ -960,29 +755,21 @@ with ui.row().classes(
 
         current_study_label = ui.label(
             "Current Study: Sample CT"
-        ).classes(
-            "text-sm text-gray-600"
         )
 
         modality_selector = ui.select(
-            options=[
-                "CT",
-                "MRI",
-                "Ultrasound",
-            ],
+            ["CT", "MRI", "Ultrasound"],
             value="CT",
             label="Load Sample Study",
             on_change=change_modality,
         ).classes(
             "w-full"
-        ).props(
-            "outlined"
         )
 
         ui.separator()
 
         ui.label(
-            "Upload DICOM Study"
+            "Upload DICOM Files"
         ).classes(
             "text-lg font-semibold"
         )
@@ -996,7 +783,7 @@ with ui.row().classes(
             on_upload=handle_dicom_upload,
             multiple=True,
             auto_upload=True,
-            max_files=1000,
+            max_files=2000,
         ).props(
             "accept=.dcm,application/dicom"
         ).classes(
@@ -1004,9 +791,28 @@ with ui.row().classes(
         )
 
         ui.button(
-            "Load Uploaded Study",
+            "Analyze Uploaded Files",
+            icon="search",
+            on_click=analyze_uploaded_files,
+        ).classes(
+            "w-full"
+        )
+
+        series_status_label = ui.label(
+            "Detected series: 0"
+        )
+
+        uploaded_series_selector = ui.select(
+            options=[],
+            label="Select Uploaded Series",
+        ).classes(
+            "w-full"
+        )
+
+        ui.button(
+            "Load Selected Series",
             icon="folder_open",
-            on_click=load_uploaded_study,
+            on_click=load_selected_uploaded_series,
         ).classes(
             "w-full"
         )
@@ -1037,9 +843,6 @@ with ui.row().classes(
             "w-full"
         )
 
-        ui.separator()
-
-        # CT WINDOW CONTROLS
         with ui.column().classes(
             "w-full gap-2"
         ) as window_panel:
@@ -1051,19 +854,14 @@ with ui.row().classes(
             )
 
             with ui.row().classes(
-                "w-full gap-2"
+                "w-full"
             ):
-
                 ui.button(
                     "Lung",
                     on_click=lambda:
                     apply_window_preset(
                         "Lung"
                     ),
-                ).props(
-                    "outline dense"
-                ).classes(
-                    "flex-1"
                 )
 
                 ui.button(
@@ -1072,26 +870,17 @@ with ui.row().classes(
                     apply_window_preset(
                         "Soft Tissue"
                     ),
-                ).props(
-                    "outline dense"
-                ).classes(
-                    "flex-1"
                 )
 
             with ui.row().classes(
-                "w-full gap-2"
+                "w-full"
             ):
-
                 ui.button(
                     "Bone",
                     on_click=lambda:
                     apply_window_preset(
                         "Bone"
                     ),
-                ).props(
-                    "outline dense"
-                ).classes(
-                    "flex-1"
                 )
 
                 ui.button(
@@ -1100,32 +889,25 @@ with ui.row().classes(
                     apply_window_preset(
                         "Brain"
                     ),
-                ).props(
-                    "outline dense"
-                ).classes(
-                    "flex-1"
                 )
 
             window_center_input = ui.number(
-                label="Window Center",
+                "Window Center",
                 value=40,
-                step=1,
             ).classes(
                 "w-full"
             )
 
             window_width_input = ui.number(
-                label="Window Width",
+                "Window Width",
                 value=400,
                 min=1,
-                step=1,
             ).classes(
                 "w-full"
             )
 
             ui.button(
                 "Apply Custom Window",
-                icon="tune",
                 on_click=apply_custom_window,
             ).classes(
                 "w-full"
@@ -1133,9 +915,8 @@ with ui.row().classes(
 
         ui.separator()
 
-        # ZOOM CONTROLS
         ui.label(
-            "Zoom"
+            "View Tools"
         ).classes(
             "text-lg font-semibold"
         )
@@ -1144,16 +925,17 @@ with ui.row().classes(
             "Zoom: 100%"
         )
 
+        rotation_label = ui.label(
+            "Rotation: 0°"
+        )
+
         with ui.row().classes(
             "w-full gap-2"
         ):
-
             ui.button(
                 "Zoom In",
                 icon="zoom_in",
                 on_click=zoom_in,
-            ).props(
-                "outline dense"
             ).classes(
                 "flex-1"
             )
@@ -1162,8 +944,42 @@ with ui.row().classes(
                 "Zoom Out",
                 icon="zoom_out",
                 on_click=zoom_out,
-            ).props(
-                "outline dense"
+            ).classes(
+                "flex-1"
+            )
+
+        with ui.row().classes(
+            "w-full gap-2"
+        ):
+            ui.button(
+                "Rotate Left",
+                icon="rotate_left",
+                on_click=rotate_left,
+            ).classes(
+                "flex-1"
+            )
+
+            ui.button(
+                "Rotate Right",
+                icon="rotate_right",
+                on_click=rotate_right,
+            ).classes(
+                "flex-1"
+            )
+
+        with ui.row().classes(
+            "w-full gap-2"
+        ):
+            ui.button(
+                "Flip H",
+                on_click=toggle_flip_horizontal,
+            ).classes(
+                "flex-1"
+            )
+
+            ui.button(
+                "Flip V",
+                on_click=toggle_flip_vertical,
             ).classes(
                 "flex-1"
             )
@@ -1172,15 +988,28 @@ with ui.row().classes(
             "Fit to Screen",
             icon="fit_screen",
             on_click=fit_to_screen,
-        ).props(
-            "outline"
+        ).classes(
+            "w-full"
+        )
+
+        ui.button(
+            "Full Screen",
+            icon="fullscreen",
+            on_click=enter_fullscreen,
+        ).classes(
+            "w-full"
+        )
+
+        ui.button(
+            "Reset View",
+            icon="refresh",
+            on_click=reset_view,
         ).classes(
             "w-full"
         )
 
         ui.separator()
 
-        # BRIGHTNESS / CONTRAST
         brightness_label = ui.label(
             "Brightness: 0"
         )
@@ -1189,7 +1018,6 @@ with ui.row().classes(
             min=-100,
             max=100,
             value=0,
-            step=1,
             on_change=change_brightness,
         ).classes(
             "w-full"
@@ -1211,37 +1039,24 @@ with ui.row().classes(
 
         ui.button(
             "Reset Controls",
-            icon="restart_alt",
             on_click=reset_controls,
         ).classes(
             "w-full"
         )
 
-        ui.separator()
 
-        ui.label(
-            "Educational medical imaging "
-            "viewer. AI modules will be "
-            "integrated later."
-        ).classes(
-            "text-sm text-gray-600"
-        )
-
-    # CENTER IMAGE VIEWER
     with ui.column().classes(
-        "flex-grow items-center min-w-0"
+        "flex-grow min-w-0"
     ):
 
         image_title = ui.label(
             "CT Image"
         ).classes(
-            "text-2xl font-semibold self-start"
+            "text-2xl font-semibold"
         )
 
         file_name_label = ui.label(
             "File:"
-        ).classes(
-            "text-xs text-gray-500 self-start"
         )
 
         with ui.element(
@@ -1251,21 +1066,17 @@ with ui.row().classes(
         ):
 
             dicom_image = ui.image().classes(
-                "viewer-image "
-                "w-full max-w-4xl"
+                "viewer-image w-full max-w-4xl"
             )
 
         viewer_status_label = ui.label(
             "Viewer ready"
-        ).classes(
-            "text-sm text-gray-600 self-start"
         )
 
-    # RIGHT METADATA PANEL
+
     with ui.column().classes(
         "metadata-panel w-80 "
-        "bg-slate-100 rounded-lg "
-        "p-5 shadow"
+        "bg-slate-100 rounded-lg p-5 shadow"
     ):
 
         ui.label(
@@ -1275,66 +1086,39 @@ with ui.row().classes(
         )
 
         modality_label = ui.label()
-
         manufacturer_label = ui.label()
-
         model_label = ui.label()
-
         study_date_label = ui.label()
-
         series_label = ui.label()
-
         body_part_label = ui.label()
-
         dimensions_label = ui.label()
-
         frames_label = ui.label()
-
         photometric_label = ui.label()
-
         pixel_spacing_label = ui.label()
-
         slice_thickness_label = ui.label()
-
         window_center_label = ui.label()
-
         window_width_label = ui.label()
-
         sop_class_label = ui.label()
-
         study_uid_label = ui.label().classes(
             "break-all"
         )
-
         series_uid_label = ui.label().classes(
             "break-all"
         )
-
         transfer_syntax_label = ui.label().classes(
             "break-all"
         )
 
 
-sample_ct_files = find_dicom_files(
+sample_files = find_dicom_files(
     MODALITY_FOLDERS["CT"]
 )
 
-
-if sample_ct_files:
-
+if sample_files:
     configure_study(
-        files=sample_ct_files,
-        modality="CT",
-        source="Sample CT",
-    )
-
-else:
-
-    ui.notify(
-        "No sample CT DICOM "
-        "files were found.",
-        type="negative",
-        position="top",
+        sample_files,
+        "CT",
+        "Sample CT",
     )
 
 
