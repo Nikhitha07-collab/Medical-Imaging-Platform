@@ -1,0 +1,9 @@
+{
+    "threshold": 0.5799999999999997,
+    "selection_dataset": "validation",
+    "selection_metric": "balanced_accuracy",
+    "validation_auc": 0.785472,
+    "balanced_accuracy": 0.7226666666666667,
+    "benign_recall": 0.808,
+    "malignant_recall": 0.6373333333333333
+}

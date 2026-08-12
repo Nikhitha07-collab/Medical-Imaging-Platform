@@ -4,6 +4,8 @@ import shutil
 
 import pydicom
 
+from utils.image_loader import is_standard_image
+
 
 UPLOAD_FOLDER = Path("uploaded_data")
 
@@ -23,7 +25,7 @@ def prepare_upload_folder() -> Path:
 
 
 def read_header(file_path: Path):
-    """Read only DICOM metadata without decoding image pixels."""
+    """Read DICOM metadata without loading pixel data."""
 
     return pydicom.dcmread(
         file_path,
@@ -32,11 +34,12 @@ def read_header(file_path: Path):
 
 
 def is_valid_dicom(file_path: Path) -> bool:
-    """Return True if the file can be read as DICOM."""
+    """Check whether a file is a valid DICOM file."""
 
     try:
         read_header(file_path)
         return True
+
     except Exception:
         return False
 
@@ -47,20 +50,40 @@ def find_dicom_files(folder: Path) -> list[Path]:
     if not folder.exists():
         return []
 
-    files = []
+    dicom_files: list[Path] = []
 
     for file_path in folder.rglob("*"):
+
         if not file_path.is_file():
             continue
 
         if is_valid_dicom(file_path):
-            files.append(file_path)
+            dicom_files.append(file_path)
 
-    return files
+    return dicom_files
+
+
+def find_standard_images(folder: Path) -> list[Path]:
+    """Find PNG, JPG, and JPEG files."""
+
+    if not folder.exists():
+        return []
+
+    image_files: list[Path] = []
+
+    for file_path in folder.rglob("*"):
+
+        if not file_path.is_file():
+            continue
+
+        if is_standard_image(file_path):
+            image_files.append(file_path)
+
+    return sorted(image_files)
 
 
 def normalize_modality(value: str) -> str:
-    """Convert DICOM modality codes into viewer names."""
+    """Convert DICOM modality codes into readable names."""
 
     modality = str(value).upper()
 
@@ -77,7 +100,7 @@ def normalize_modality(value: str) -> str:
 
 
 def detect_modality(file_path: Path) -> str:
-    """Detect modality from one DICOM file."""
+    """Detect modality from a DICOM file."""
 
     dataset = read_header(file_path)
 
@@ -90,10 +113,8 @@ def detect_modality(file_path: Path) -> str:
     )
 
 
-def get_instance_number(
-    file_path: Path,
-) -> int:
-    """Read InstanceNumber for slice ordering."""
+def get_instance_number(file_path: Path) -> int:
+    """Get InstanceNumber for correct slice ordering."""
 
     try:
         dataset = read_header(file_path)
@@ -114,19 +135,14 @@ def get_instance_number(
 def group_dicom_series(
     files: list[Path],
 ) -> dict[str, dict]:
-    """
-    Group uploaded DICOM files by StudyInstanceUID
-    and SeriesInstanceUID.
-    """
+    """Group DICOM files by StudyInstanceUID and SeriesInstanceUID."""
 
     grouped_files = defaultdict(list)
 
     for file_path in files:
 
         try:
-            dataset = read_header(
-                file_path
-            )
+            dataset = read_header(file_path)
 
             study_uid = str(
                 getattr(
@@ -144,19 +160,17 @@ def group_dicom_series(
                 )
             )
 
-            key = (
-                study_uid,
-                series_uid,
-            )
-
-            grouped_files[key].append(
-                file_path
-            )
+            grouped_files[
+                (
+                    study_uid,
+                    series_uid,
+                )
+            ].append(file_path)
 
         except Exception:
             continue
 
-    series_data = {}
+    series_data: dict[str, dict] = {}
 
     for (
         study_uid,
@@ -213,3 +227,14 @@ def group_dicom_series(
         }
 
     return series_data
+
+
+def classify_uploaded_files(
+    folder: Path,
+) -> dict[str, list[Path]]:
+    """Separate uploaded files into DICOM and PNG/JPG groups."""
+
+    return {
+        "dicom": find_dicom_files(folder),
+        "standard": find_standard_images(folder),
+    }

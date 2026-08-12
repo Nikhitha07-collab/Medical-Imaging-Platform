@@ -49,3 +49,8 @@ Thumbs.db
 *.tmp
 # Temporary uploaded medical images
 uploaded_data/
+# Local training datasets
+training_data/
+
+# Local backup files
+app_before_classifier.py
