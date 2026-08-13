@@ -5,7 +5,10 @@ from typing import Any
 
 from nicegui import events, ui
 from PIL import Image
+import numpy as np
 
+from ai.ct_classifier import CTClassifier
+from ai.mri_classifier import MRIClassifier
 from ai.ultrasound_classifier import UltrasoundClassifier
 from utils.dicom_loader import load_dicom
 from utils.image_loader import load_standard_image
@@ -66,8 +69,13 @@ flip_vertical = False
 
 measurement_mode = False
 measurement_points: list[tuple[float, float]] = []
+hu_probe_mode = False
+roi_mode = False
+roi_points: list[tuple[float, float]] = []
 saved_annotations: list[str] = []
 
+ct_classifier = CTClassifier()
+mri_classifier = MRIClassifier()
 ultrasound_classifier = UltrasoundClassifier()
 
 
@@ -184,6 +192,12 @@ def clear_metadata() -> None:
     transfer_syntax_label.set_text(
         "Transfer Syntax UID: Not available"
     )
+    if "sequence_name_label" in globals():
+        sequence_name_label.set_text("Sequence Name: Not available")
+        repetition_time_label.set_text("TR: Not available")
+        echo_time_label.set_text("TE: Not available")
+        flip_angle_label.set_text("Flip Angle: Not available")
+        field_strength_label.set_text("Magnetic Field Strength: Not available")
 
 
 def update_metadata(
@@ -214,10 +228,72 @@ def update_metadata(
         f"{safe_value(dataset, 'SeriesDescription')}"
     )
 
-    body_part_label.set_text(
-        "Body Part: "
-        f"{safe_value(dataset, 'BodyPartExamined')}"
+    body_part = safe_value(
+        dataset,
+        "BodyPartExamined",
     )
+
+    body_part_source = None
+
+    if (
+        body_part == "Not available"
+        or not str(body_part).strip()
+    ):
+        descriptions = [
+            safe_value(dataset, "SeriesDescription"),
+            safe_value(dataset, "StudyDescription"),
+            safe_value(dataset, "ProtocolName"),
+        ]
+
+        combined_description = " ".join(
+            str(value).upper()
+            for value in descriptions
+            if value != "Not available"
+        )
+
+        body_part_keywords = {
+            "CHEST": "Chest",
+            "THORAX": "Chest",
+            "LUNG": "Chest",
+            "BRAIN": "Brain",
+            "HEAD": "Head",
+            "ABDOMEN": "Abdomen",
+            "ABDOMINAL": "Abdomen",
+            "PELVIS": "Pelvis",
+            "SPINE": "Spine",
+            "CERVICAL": "Cervical Spine",
+            "THORACIC": "Thoracic Spine",
+            "LUMBAR": "Lumbar Spine",
+            "KNEE": "Knee",
+            "SHOULDER": "Shoulder",
+            "THYROID": "Thyroid",
+            "BREAST": "Breast",
+            "CARDIAC": "Heart",
+            "HEART": "Heart",
+        }
+
+        for keyword, inferred_part in body_part_keywords.items():
+            if keyword in combined_description:
+                body_part = inferred_part
+                body_part_source = "inferred"
+                break
+
+    if (
+        body_part == "Not available"
+        or not str(body_part).strip()
+    ):
+        body_part_label.set_text(
+            "Body Part: Not available"
+        )
+    elif body_part_source == "inferred":
+        body_part_label.set_text(
+            f"Body Part: {body_part} "
+            "(inferred from study/series metadata)"
+        )
+    else:
+        body_part_label.set_text(
+            f"Body Part: {body_part}"
+        )
 
     dimensions_label.set_text(
         "Dimensions: "
@@ -274,6 +350,12 @@ def update_metadata(
         "Transfer Syntax UID: "
         f"{get_transfer_syntax(dataset)}"
     )
+    if "sequence_name_label" in globals():
+        sequence_name_label.set_text(f"Sequence Name: {safe_value(dataset, 'SequenceName')}")
+        repetition_time_label.set_text(f"TR: {safe_value(dataset, 'RepetitionTime')}")
+        echo_time_label.set_text(f"TE: {safe_value(dataset, 'EchoTime')}")
+        flip_angle_label.set_text(f"Flip Angle: {safe_value(dataset, 'FlipAngle')}")
+        field_strength_label.set_text(f"Magnetic Field Strength: {safe_value(dataset, 'MagneticFieldStrength')}")
 
 
 def get_current_window():
@@ -458,6 +540,457 @@ async def save_screenshot() -> None:
     )
 
 
+
+# ---------------------------------------------------------
+# DICOM ANALYSIS TOOLS
+# ---------------------------------------------------------
+
+def _dicom_numeric_array(dataset: Any) -> np.ndarray:
+    array = np.asarray(dataset.pixel_array, dtype=np.float32)
+    if array.ndim > 2:
+        array = np.asarray(array[0], dtype=np.float32)
+    slope = float(getattr(dataset, "RescaleSlope", 1.0) or 1.0)
+    intercept = float(getattr(dataset, "RescaleIntercept", 0.0) or 0.0)
+    return array * slope + intercept
+
+
+def _point_to_pixel(point, shape):
+    x, y = point
+    h, w = shape
+    return (
+        int(round(max(0, min(float(x), w - 1)))),
+        int(round(max(0, min(float(y), h - 1)))),
+    )
+
+
+def clear_analysis_overlay() -> None:
+    roi_points.clear()
+    viewer_image.set_content("")
+    hu_probe_result_label.set_text("Click a CT pixel to read its HU value.")
+    roi_result_label.set_text("No ROI selected")
+
+
+def toggle_hu_probe_mode() -> None:
+    global hu_probe_mode, roi_mode, measurement_mode
+    if current_modality != "CT" or current_file_type != "DICOM":
+        ui.notify("HU Probe is available for CT DICOM images only.", type="warning")
+        return
+    hu_probe_mode = not hu_probe_mode
+    if hu_probe_mode:
+        roi_mode = False
+        measurement_mode = False
+        roi_points.clear()
+        measurement_points.clear()
+        viewer_image.set_content("")
+        measurement_mode_label.set_text("Measurement Mode: OFF")
+        roi_mode_label.set_text("ROI Mode: OFF")
+        hu_probe_mode_label.set_text("HU Probe: ON")
+        ui.notify("HU Probe enabled. Click a point on the CT image.", type="positive")
+    else:
+        hu_probe_mode_label.set_text("HU Probe: OFF")
+
+
+def toggle_roi_mode() -> None:
+    global roi_mode, hu_probe_mode, measurement_mode
+    if current_file_type != "DICOM":
+        ui.notify("ROI statistics require a DICOM image.", type="warning")
+        return
+    roi_mode = not roi_mode
+    if roi_mode:
+        hu_probe_mode = False
+        measurement_mode = False
+        roi_points.clear()
+        measurement_points.clear()
+        viewer_image.set_content("")
+        measurement_mode_label.set_text("Measurement Mode: OFF")
+        hu_probe_mode_label.set_text("HU Probe: OFF")
+        roi_mode_label.set_text("ROI Mode: ON")
+        roi_result_label.set_text("Select two opposite corners of a rectangular ROI.")
+    else:
+        roi_mode_label.set_text("ROI Mode: OFF")
+
+
+def _update_roi_overlay() -> None:
+    if not roi_points:
+        viewer_image.set_content("")
+        return
+    parts = []
+    for x, y in roi_points:
+        parts.append(f'<circle cx="{x}" cy="{y}" r="6" fill="#22c55e" stroke="white" stroke-width="2" />')
+    if len(roi_points) == 2:
+        x1, y1 = roi_points[0]
+        x2, y2 = roi_points[1]
+        parts.append(
+            f'<rect x="{min(x1,x2)}" y="{min(y1,y2)}" '
+            f'width="{abs(x2-x1)}" height="{abs(y2-y1)}" '
+            f'fill="none" stroke="#22c55e" stroke-width="3" />'
+        )
+    viewer_image.set_content("".join(parts))
+
+
+def _handle_hu_probe(point) -> None:
+    if current_dataset is None:
+        return
+    try:
+        array = _dicom_numeric_array(current_dataset)
+        x, y = _point_to_pixel(point, array.shape)
+        value = float(array[y, x])
+        hu_probe_result_label.set_text(f"Pixel ({x}, {y}) | CT value: {value:.1f} HU")
+        viewer_image.set_content(
+            f'<circle cx="{point[0]}" cy="{point[1]}" r="7" fill="red" stroke="white" stroke-width="2" />'
+        )
+    except Exception as error:
+        ui.notify(f"Unable to read CT value: {error}", type="negative")
+
+
+def _handle_roi_click(point) -> None:
+    if current_dataset is None:
+        return
+    if len(roi_points) >= 2:
+        roi_points.clear()
+    roi_points.append(point)
+    _update_roi_overlay()
+    if len(roi_points) == 1:
+        roi_result_label.set_text("First corner selected. Select the opposite corner.")
+        return
+    try:
+        array = _dicom_numeric_array(current_dataset)
+        x1, y1 = _point_to_pixel(roi_points[0], array.shape)
+        x2, y2 = _point_to_pixel(roi_points[1], array.shape)
+        x0, x1 = sorted((x1, x2))
+        y0, y1 = sorted((y1, y2))
+        region = array[y0:y1+1, x0:x1+1]
+        if region.size == 0:
+            roi_result_label.set_text("ROI is empty")
+            return
+        text = (
+            f"Mean: {np.mean(region):.1f} | Min: {np.min(region):.1f} | "
+            f"Max: {np.max(region):.1f} | SD: {np.std(region):.1f}"
+        )
+        if current_modality == "CT":
+            text = "CT ROI (HU) | " + text
+        spacing = getattr(current_dataset, "PixelSpacing", None)
+        if spacing is not None and len(spacing) >= 2:
+            area = region.shape[0] * float(spacing[0]) * region.shape[1] * float(spacing[1])
+            text += f" | Area: {area:.1f} mm²"
+        roi_result_label.set_text(text)
+    except Exception as error:
+        ui.notify(f"Unable to calculate ROI statistics: {error}", type="negative")
+
+
+def previous_slice() -> None:
+    if not current_files:
+        return
+    new_index = max(current_slice_index - 1, 0)
+    slice_slider.value = new_index
+    slice_slider.update()
+    load_current_image(new_index)
+
+
+def next_slice() -> None:
+    if not current_files:
+        return
+    new_index = min(current_slice_index + 1, len(current_files) - 1)
+    slice_slider.value = new_index
+    slice_slider.update()
+    load_current_image(new_index)
+
+
+def show_mpr_preview() -> None:
+    if (
+        current_file_type != "DICOM"
+        or current_modality not in {"CT", "MRI"}
+        or len(current_files) < 3
+    ):
+        ui.notify(
+            "Load a multi-slice CT or MRI DICOM series first.",
+            type="warning",
+        )
+        return
+
+    try:
+        records = []
+
+        for path in current_files:
+            dataset = load_dicom(path)
+
+            array = np.asarray(
+                dataset.pixel_array,
+                dtype=np.float32,
+            )
+
+            if array.ndim > 2:
+                array = array[0]
+
+            if current_modality == "CT":
+                slope = float(
+                    getattr(dataset, "RescaleSlope", 1.0) or 1.0
+                )
+                intercept = float(
+                    getattr(dataset, "RescaleIntercept", 0.0) or 0.0
+                )
+                array = array * slope + intercept
+
+            position = getattr(
+                dataset,
+                "ImagePositionPatient",
+                None,
+            )
+
+            instance_number = getattr(
+                dataset,
+                "InstanceNumber",
+                None,
+            )
+
+            pixel_spacing = getattr(
+                dataset,
+                "PixelSpacing",
+                None,
+            )
+
+            records.append(
+                {
+                    "dataset": dataset,
+                    "array": array,
+                    "position": position,
+                    "instance": instance_number,
+                    "pixel_spacing": pixel_spacing,
+                }
+            )
+
+        def sort_key(record):
+            position = record["position"]
+
+            if position is not None and len(position) >= 3:
+                try:
+                    return (0, float(position[2]))
+                except Exception:
+                    pass
+
+            instance = record["instance"]
+
+            try:
+                return (1, float(instance))
+            except Exception:
+                return (2, 0.0)
+
+        records.sort(key=sort_key)
+
+        slices = [record["array"] for record in records]
+
+        h = min(a.shape[0] for a in slices)
+        w = min(a.shape[1] for a in slices)
+
+        volume = np.stack(
+            [a[:h, :w] for a in slices],
+            axis=0,
+        )
+
+        # In-plane spacing: DICOM PixelSpacing = [row_spacing, column_spacing].
+        row_spacing = 1.0
+        col_spacing = 1.0
+
+        for record in records:
+            spacing = record["pixel_spacing"]
+
+            if spacing is not None and len(spacing) >= 2:
+                try:
+                    row_spacing = float(spacing[0])
+                    col_spacing = float(spacing[1])
+                    break
+                except Exception:
+                    pass
+
+        # Prefer geometric slice spacing derived from ImagePositionPatient.
+        z_positions = []
+
+        for record in records:
+            position = record["position"]
+
+            if position is not None and len(position) >= 3:
+                try:
+                    z_positions.append(float(position[2]))
+                except Exception:
+                    pass
+
+        slice_spacing = None
+
+        if len(z_positions) >= 2:
+            differences = np.abs(np.diff(np.asarray(z_positions, dtype=np.float32)))
+            differences = differences[differences > 1e-6]
+
+            if differences.size:
+                slice_spacing = float(np.median(differences))
+
+        if slice_spacing is None:
+            first_dataset = records[0]["dataset"]
+
+            for attribute in ("SpacingBetweenSlices", "SliceThickness"):
+                value = getattr(first_dataset, attribute, None)
+
+                try:
+                    if value is not None and float(value) > 0:
+                        slice_spacing = float(value)
+                        break
+                except Exception:
+                    pass
+
+        if slice_spacing is None:
+            slice_spacing = row_spacing
+
+        axial = volume[volume.shape[0] // 2]
+        coronal = volume[:, volume.shape[1] // 2, :]
+        sagittal = volume[:, :, volume.shape[2] // 2]
+
+        def normalize_for_display(array):
+            array = np.asarray(array, dtype=np.float32)
+
+            if current_modality == "CT":
+                center, width = get_current_window()
+
+                if center is None or width is None:
+                    center, width = 40.0, 400.0
+
+                low = float(center) - float(width) / 2.0
+                high = float(center) + float(width) / 2.0
+            else:
+                low, high = np.percentile(array, [1, 99])
+
+            if high <= low:
+                low = float(array.min())
+                high = float(array.max())
+
+            if high <= low:
+                return np.zeros(array.shape, dtype=np.uint8)
+
+            normalized = np.clip(
+                (array - low) / (high - low),
+                0.0,
+                1.0,
+            )
+
+            return (normalized * 255.0).astype(np.uint8)
+
+        def resize_for_physical_spacing(
+            image_array,
+            vertical_spacing,
+            horizontal_spacing,
+        ):
+            image_array = normalize_for_display(image_array)
+
+            rows, cols = image_array.shape[:2]
+
+            physical_height = max(rows * float(vertical_spacing), 1e-6)
+            physical_width = max(cols * float(horizontal_spacing), 1e-6)
+
+            target_width = min(max(cols, 256), 900)
+            target_height = int(
+                round(
+                    target_width
+                    * physical_height
+                    / physical_width
+                )
+            )
+
+            target_height = min(max(target_height, 96), 900)
+
+            pil_image = Image.fromarray(image_array)
+            pil_image = pil_image.resize(
+                (target_width, target_height),
+                Image.Resampling.BILINEAR,
+            )
+
+            return np.asarray(pil_image)
+
+        axial_display = resize_for_physical_spacing(
+            axial,
+            row_spacing,
+            col_spacing,
+        )
+
+        coronal_display = resize_for_physical_spacing(
+            coronal,
+            slice_spacing,
+            col_spacing,
+        )
+
+        sagittal_display = resize_for_physical_spacing(
+            sagittal,
+            slice_spacing,
+            row_spacing,
+        )
+
+        views = {
+            "Axial": axial_display,
+            "Coronal": coronal_display,
+            "Sagittal": sagittal_display,
+        }
+
+        spacing_summary = (
+            f"Voxel spacing: "
+            f"{row_spacing:.3f} × "
+            f"{col_spacing:.3f} × "
+            f"{slice_spacing:.3f} mm"
+        )
+
+        with ui.dialog() as dialog, ui.card().classes(
+            "w-[95vw] max-w-6xl"
+        ):
+            ui.label(
+                f"{current_modality} MPR Preview"
+            ).classes(
+                "text-xl font-semibold"
+            )
+
+            ui.label(
+                "Research/demo reconstruction using DICOM spatial spacing."
+            ).classes(
+                "text-sm text-gray-600"
+            )
+
+            ui.label(
+                spacing_summary
+            ).classes(
+                "text-xs text-gray-500"
+            )
+
+            with ui.row().classes(
+                "w-full gap-4 no-wrap items-start"
+            ):
+                for title, image_array in views.items():
+                    with ui.column().classes(
+                        "flex-1 items-center min-w-0"
+                    ):
+                        ui.label(
+                            title
+                        ).classes(
+                            "font-semibold"
+                        )
+
+                        ui.image(
+                            image_to_data_url(image_array)
+                        ).classes(
+                            "w-full max-h-[60vh] object-contain bg-black"
+                        )
+
+            ui.button(
+                "Close",
+                on_click=dialog.close,
+            ).props(
+                "outline"
+            )
+
+        dialog.open()
+
+    except Exception as error:
+        ui.notify(
+            f"Unable to build MPR preview: {error}",
+            type="negative",
+            position="top",
+        )
+
+
 # ---------------------------------------------------------
 # MEASUREMENT
 # ---------------------------------------------------------
@@ -525,6 +1058,11 @@ def toggle_measurement_mode() -> None:
     )
 
     if measurement_mode:
+        global hu_probe_mode, roi_mode
+        hu_probe_mode = False
+        roi_mode = False
+        hu_probe_mode_label.set_text("HU Probe: OFF")
+        roi_mode_label.set_text("ROI Mode: OFF")
         reset_view()
 
         clear_measurement(
@@ -550,6 +1088,16 @@ def toggle_measurement_mode() -> None:
 def handle_image_click(
     event: events.MouseEventArguments,
 ) -> None:
+    point = (float(event.image_x), float(event.image_y))
+
+    if hu_probe_mode:
+        _handle_hu_probe(point)
+        return
+
+    if roi_mode:
+        _handle_roi_click(point)
+        return
+
     if not measurement_mode:
         return
 
@@ -557,11 +1105,6 @@ def handle_image_click(
         clear_measurement(
             silent=True
         )
-
-    point = (
-        float(event.image_x),
-        float(event.image_y),
-    )
 
     measurement_points.append(
         point
@@ -683,6 +1226,129 @@ def clear_annotations() -> None:
 
 
 # ---------------------------------------------------------
+# CT / MRI STANDARD-IMAGE ANALYSIS
+# ---------------------------------------------------------
+
+def _confidence_level(confidence: float) -> str:
+    if confidence < 0.60:
+        return "Low"
+    if confidence < 0.80:
+        return "Moderate"
+    return "High"
+
+
+def reset_ct_result() -> None:
+    ct_prediction_label.set_text("Prediction: Not run")
+    ct_noncovid_label.set_text("NonCOVID probability: --")
+    ct_covid_label.set_text("COVID probability: --")
+    ct_confidence_label.set_text("Model confidence: --")
+    ct_confidence_level_label.set_text("Confidence level: --")
+    ct_noncovid_progress.value = 0.0
+    ct_covid_progress.value = 0.0
+    ct_noncovid_progress.update()
+    ct_covid_progress.update()
+
+
+def reset_mri_result() -> None:
+    mri_prediction_label.set_text("Prediction: Not run")
+    mri_meningioma_label.set_text("Meningioma probability: --")
+    mri_glioma_label.set_text("Glioma probability: --")
+    mri_pituitary_label.set_text("Pituitary probability: --")
+    mri_confidence_label.set_text("Model confidence: --")
+    mri_confidence_level_label.set_text("Confidence level: --")
+    mri_meningioma_progress.value = 0.0
+    mri_glioma_progress.value = 0.0
+    mri_pituitary_progress.value = 0.0
+    mri_meningioma_progress.update()
+    mri_glioma_progress.update()
+    mri_pituitary_progress.update()
+
+
+def update_ct_mri_analysis_availability() -> None:
+    reset_ct_result()
+    reset_mri_result()
+    ct_supported = current_modality == "CT" and current_file_type == "PNG/JPG"
+    mri_supported = current_modality == "MRI" and current_file_type == "PNG/JPG"
+    ct_analysis_panel.set_visibility(ct_supported)
+    mri_analysis_panel.set_visibility(mri_supported)
+
+    if ct_supported:
+        ct_status_label.set_text("Status: Ready for CT classification.")
+        ct_analysis_button.enable()
+    else:
+        ct_analysis_button.disable()
+
+    if mri_supported:
+        mri_status_label.set_text("Status: Ready for brain MRI classification.")
+        mri_analysis_button.enable()
+    else:
+        mri_analysis_button.disable()
+
+
+def run_ct_classification() -> None:
+    if current_modality != "CT" or current_file_type != "PNG/JPG" or not current_files:
+        ui.notify("Load a CT PNG/JPG image first.", type="warning")
+        return
+    selected_file = current_files[current_slice_index]
+    try:
+        ct_status_label.set_text("Status: Running classification...")
+        ct_analysis_button.disable()
+        result = ct_classifier.predict(selected_file)
+        noncovid = float(result["noncovid_probability"])
+        covid = float(result["covid_probability"])
+        confidence = float(result["confidence"])
+        ct_prediction_label.set_text(f"Prediction: {result['prediction']}")
+        ct_noncovid_label.set_text(f"NonCOVID probability: {noncovid * 100:.1f}%")
+        ct_covid_label.set_text(f"COVID probability: {covid * 100:.1f}%")
+        ct_noncovid_progress.value = noncovid
+        ct_covid_progress.value = covid
+        ct_noncovid_progress.update()
+        ct_covid_progress.update()
+        ct_confidence_label.set_text(f"Model confidence: {confidence * 100:.1f}%")
+        ct_confidence_level_label.set_text(f"Confidence level: {_confidence_level(confidence)}")
+        ct_threshold_label.set_text(f"Decision threshold: {result['threshold']:.2f}")
+        ct_status_label.set_text("Status: Classification complete.")
+    except Exception as error:
+        ct_status_label.set_text("Status: Classification failed.")
+        ui.notify(f"Unable to run CT classification: {error}", type="negative", position="top")
+    finally:
+        ct_analysis_button.enable()
+
+
+def run_mri_classification() -> None:
+    if current_modality != "MRI" or current_file_type != "PNG/JPG" or not current_files:
+        ui.notify("Load a brain MRI PNG/JPG image first.", type="warning")
+        return
+    selected_file = current_files[current_slice_index]
+    try:
+        mri_status_label.set_text("Status: Running classification...")
+        mri_analysis_button.disable()
+        result = mri_classifier.predict(selected_file)
+        meningioma = float(result["meningioma_probability"])
+        glioma = float(result["glioma_probability"])
+        pituitary = float(result["pituitary_probability"])
+        confidence = float(result["confidence"])
+        mri_prediction_label.set_text(f"Prediction: {result['prediction']}")
+        mri_meningioma_label.set_text(f"Meningioma probability: {meningioma * 100:.1f}%")
+        mri_glioma_label.set_text(f"Glioma probability: {glioma * 100:.1f}%")
+        mri_pituitary_label.set_text(f"Pituitary probability: {pituitary * 100:.1f}%")
+        mri_meningioma_progress.value = meningioma
+        mri_glioma_progress.value = glioma
+        mri_pituitary_progress.value = pituitary
+        mri_meningioma_progress.update()
+        mri_glioma_progress.update()
+        mri_pituitary_progress.update()
+        mri_confidence_label.set_text(f"Model confidence: {confidence * 100:.1f}%")
+        mri_confidence_level_label.set_text(f"Confidence level: {_confidence_level(confidence)}")
+        mri_status_label.set_text("Status: Classification complete.")
+    except Exception as error:
+        mri_status_label.set_text("Status: Classification failed.")
+        ui.notify(f"Unable to run MRI classification: {error}", type="negative", position="top")
+    finally:
+        mri_analysis_button.enable()
+
+
+# ---------------------------------------------------------
 # THYROID ULTRASOUND CLASSIFICATION
 # ---------------------------------------------------------
 
@@ -715,8 +1381,9 @@ def reset_classification_result() -> None:
 
 
 def update_classification_availability() -> None:
-    """Show and enable classification only for thyroid ultrasound PNG/JPG images."""
+    """Update modality-specific analysis panels for standard images."""
 
+    update_ct_mri_analysis_availability()
     reset_classification_result()
 
     is_supported = (
@@ -926,6 +1593,11 @@ def load_current_image(
     clear_measurement(
         silent=True
     )
+    roi_points.clear()
+    if "hu_probe_result_label" in globals():
+        hu_probe_result_label.set_text("Click a CT pixel to read its HU value.")
+    if "roi_result_label" in globals():
+        roi_result_label.set_text("No ROI selected")
 
     update_classification_availability()
 
@@ -1654,6 +2326,12 @@ with ui.row().classes(
             "w-full"
         )
 
+        with ui.row().classes("w-full gap-2"):
+            ui.button("Previous", icon="chevron_left", on_click=previous_slice).classes("flex-1")
+            ui.button("Next", icon="chevron_right", on_click=next_slice).classes("flex-1")
+
+        ui.button("MPR Preview", icon="view_in_ar", on_click=show_mpr_preview).props("outline").classes("w-full")
+
         # CT Windowing
         with ui.column().classes(
             "w-full gap-2"
@@ -1688,6 +2366,14 @@ with ui.row().classes(
                     on_click=lambda:
                     apply_window_preset(
                         "Bone"
+                    ),
+                )
+
+                ui.button(
+                    "Brain",
+                    on_click=lambda:
+                    apply_window_preset(
+                        "Brain"
                     ),
                 )
 
@@ -1859,6 +2545,33 @@ with ui.row().classes(
             "w-full"
         )
 
+        ui.separator()
+        ui.label("DICOM Analysis Tools").classes("text-lg font-semibold")
+
+        hu_probe_mode_label = ui.label("HU Probe: OFF")
+        ui.button(
+            "Toggle HU Probe",
+            icon="my_location",
+            on_click=toggle_hu_probe_mode,
+        ).classes("w-full")
+        hu_probe_result_label = ui.label(
+            "Click a CT pixel to read its HU value."
+        ).classes("text-sm")
+
+        roi_mode_label = ui.label("ROI Mode: OFF")
+        ui.button(
+            "Toggle ROI Mode",
+            icon="crop_square",
+            on_click=toggle_roi_mode,
+        ).classes("w-full")
+        roi_result_label = ui.label("No ROI selected").classes("text-sm break-words")
+
+        ui.button(
+            "Clear Analysis Overlay",
+            icon="layers_clear",
+            on_click=clear_analysis_overlay,
+        ).props("outline").classes("w-full")
+
 
     # CENTER
     with ui.column().classes(
@@ -1932,6 +2645,16 @@ with ui.row().classes(
             "break-all"
         )
 
+        with ui.expansion(
+            "MRI Acquisition Details",
+            icon="settings_input_component",
+        ).classes("w-full"):
+            sequence_name_label = ui.label("Sequence Name: Not available")
+            repetition_time_label = ui.label("TR: Not available")
+            echo_time_label = ui.label("TE: Not available")
+            flip_angle_label = ui.label("Flip Angle: Not available")
+            field_strength_label = ui.label("Magnetic Field Strength: Not available")
+
         ui.separator()
 
         ui.label(
@@ -1969,6 +2692,49 @@ with ui.row().classes(
 
         ui.separator()
 
+
+        with ui.column().classes(
+            "w-full gap-2 rounded-lg border border-slate-300 bg-white p-3"
+        ) as ct_analysis_panel:
+            ui.label("CT Image Analysis").classes("text-xl font-semibold")
+            ui.label("Experimental COVID-CT EfficientNetB0 classifier").classes("text-sm text-gray-600")
+            ct_status_label = ui.label("Status: Load a CT PNG/JPG image.").classes("text-sm")
+            ct_analysis_button = ui.button("Run CT Classification", icon="analytics", on_click=run_ct_classification).classes("w-full")
+            ct_analysis_button.disable()
+            ct_prediction_label = ui.label("Prediction: Not run").classes("font-semibold")
+            ct_noncovid_label = ui.label("NonCOVID probability: --")
+            ct_noncovid_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
+            ct_covid_label = ui.label("COVID probability: --")
+            ct_covid_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
+            ct_confidence_label = ui.label("Model confidence: --")
+            ct_confidence_level_label = ui.label("Confidence level: --").classes("font-medium")
+            ct_threshold_label = ui.label("Decision threshold: 0.46").classes("text-sm text-gray-600")
+            ui.button("Reset CT Analysis", icon="restart_alt", on_click=reset_ct_result).props("outline").classes("w-full")
+            ui.label("Research/demo output only. COVID-CT image classification is not for clinical diagnosis.").classes("text-xs text-gray-500")
+
+        ct_analysis_panel.set_visibility(False)
+
+        with ui.column().classes(
+            "w-full gap-2 rounded-lg border border-slate-300 bg-white p-3"
+        ) as mri_analysis_panel:
+            ui.label("Brain MRI Analysis").classes("text-xl font-semibold")
+            ui.label("Experimental EfficientNetB0 3-class classifier").classes("text-sm text-gray-600")
+            mri_status_label = ui.label("Status: Load a brain MRI PNG/JPG image.").classes("text-sm")
+            mri_analysis_button = ui.button("Run MRI Classification", icon="analytics", on_click=run_mri_classification).classes("w-full")
+            mri_analysis_button.disable()
+            mri_prediction_label = ui.label("Prediction: Not run").classes("font-semibold")
+            mri_meningioma_label = ui.label("Meningioma probability: --")
+            mri_meningioma_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
+            mri_glioma_label = ui.label("Glioma probability: --")
+            mri_glioma_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
+            mri_pituitary_label = ui.label("Pituitary probability: --")
+            mri_pituitary_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
+            mri_confidence_label = ui.label("Model confidence: --")
+            mri_confidence_level_label = ui.label("Confidence level: --").classes("font-medium")
+            ui.button("Reset MRI Analysis", icon="restart_alt", on_click=reset_mri_result).props("outline").classes("w-full")
+            ui.label("Research/demo output only. This brain MRI classifier is not for clinical diagnosis.").classes("text-xs text-gray-500")
+
+        mri_analysis_panel.set_visibility(False)
 
         with ui.column().classes(
             "w-full gap-2 rounded-lg border border-slate-300 bg-white p-3"
@@ -2086,6 +2852,21 @@ with ui.row().classes(
             )
 
 classification_panel.set_visibility(False)
+
+
+def handle_keyboard(event) -> None:
+    try:
+        if not event.action.keydown:
+            return
+        if event.key in {"ArrowLeft", "ArrowUp"}:
+            previous_slice()
+        elif event.key in {"ArrowRight", "ArrowDown"}:
+            next_slice()
+    except Exception:
+        return
+
+
+ui.keyboard(on_key=handle_keyboard)
 
 
 # ---------------------------------------------------------

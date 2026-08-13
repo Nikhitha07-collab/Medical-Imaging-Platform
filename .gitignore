@@ -54,3 +54,19 @@ training_data/
 
 # Local backup files
 app_before_classifier.py
+# Local training datasets
+training_data/
+
+# Trained model files
+models/
+
+# Local sample DICOM data
+test_data/
+
+# Temporary backup app files
+app_before_*.py
+app_*_backup.py
+
+# Generated training results
+training/**/results/
+training/**/threshold_analysis/
