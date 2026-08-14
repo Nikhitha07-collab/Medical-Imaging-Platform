@@ -8,8 +8,16 @@ from PIL import Image
 import numpy as np
 
 from ai.ct_classifier import CTClassifier
+from ai.ct_lung_gate import check_ct_lung_content
+from ai.dicom_ai_bridge import (
+    cleanup_temporary_ai_image,
+    dicom_to_temporary_png,
+)
+from ai.ct_segmenter import segment_ct
 from ai.mri_classifier import MRIClassifier
+from ai.mri_segmenter import segment_mri
 from ai.ultrasound_classifier import UltrasoundClassifier
+from ai.ultrasound_yolo_detector import UltrasoundYOLODetector
 from utils.dicom_loader import load_dicom
 from utils.image_loader import load_standard_image
 from utils.measurements import (
@@ -77,6 +85,7 @@ saved_annotations: list[str] = []
 ct_classifier = CTClassifier()
 mri_classifier = MRIClassifier()
 ultrasound_classifier = UltrasoundClassifier()
+ultrasound_yolo_detector = UltrasoundYOLODetector()
 
 
 def image_to_data_url(image_array) -> str:
@@ -94,6 +103,19 @@ def image_to_data_url(image_array) -> str:
     ).decode("utf-8")
 
     return f"data:image/png;base64,{encoded}"
+
+
+def display_modality(value: Any) -> str:
+    """Return a user-friendly modality name without changing DICOM semantics."""
+    text = str(value or "").strip().upper()
+    mapping = {
+        "MR": "MRI",
+        "MRI": "MRI",
+        "US": "Ultrasound",
+        "ULTRASOUND": "Ultrasound",
+        "CT": "CT",
+    }
+    return mapping.get(text, str(value or "Not available"))
 
 
 def safe_value(
@@ -126,8 +148,11 @@ def get_transfer_syntax(
 
 def clear_metadata() -> None:
     modality_label.set_text(
-        f"Modality: {current_modality}"
+        f"Modality: {display_modality(current_modality)}"
     )
+
+    if "mri_acquisition_panel" in globals():
+        mri_acquisition_panel.set_visibility(False)
 
     manufacturer_label.set_text(
         "Manufacturer: Not available"
@@ -203,10 +228,15 @@ def clear_metadata() -> None:
 def update_metadata(
     dataset: Any,
 ) -> None:
+    raw_modality = safe_value(dataset, "Modality")
     modality_label.set_text(
-        "Modality: "
-        f"{safe_value(dataset, 'Modality')}"
+        f"Modality: {display_modality(raw_modality)}"
     )
+
+    if "mri_acquisition_panel" in globals():
+        mri_acquisition_panel.set_visibility(
+            str(raw_modality).strip().upper() in {"MR", "MRI"}
+        )
 
     manufacturer_label.set_text(
         "Manufacturer: "
@@ -1248,6 +1278,24 @@ def reset_ct_result() -> None:
     ct_noncovid_progress.update()
     ct_covid_progress.update()
 
+    if "ct_localization_status_label" in globals():
+        ct_localization_status_label.set_text("Infection localization: Not run")
+        ct_localization_coverage_label.set_text("Predicted infection coverage: --")
+        ct_localization_probability_label.set_text("Mean segmentation probability: --")
+        ct_localization_bbox_label.set_text("Bounding box: --")
+
+
+def reset_ct_analysis() -> None:
+    """Reset CT results and restore the original image in the main viewer."""
+    reset_ct_result()
+
+    if (
+        current_modality == "CT"
+        and current_file_type == "PNG/JPG"
+        and current_files
+    ):
+        load_current_image(current_slice_index)
+
 
 def reset_mri_result() -> None:
     mri_prediction_label.set_text("Prediction: Not run")
@@ -1263,89 +1311,1549 @@ def reset_mri_result() -> None:
     mri_glioma_progress.update()
     mri_pituitary_progress.update()
 
+    if "mri_localization_status_label" in globals():
+        mri_localization_status_label.set_text("Tumor localization: Not run")
+        mri_localization_coverage_label.set_text("Predicted region coverage: --")
+        mri_localization_probability_label.set_text("Mean segmentation probability: --")
+        mri_localization_bbox_label.set_text("Bounding box: --")
+        mri_localization_image.set_visibility(False)
+
+
+def reset_mri_analysis() -> None:
+    """Reset MRI results and restore the original image in the main viewer."""
+    reset_mri_result()
+
+    if (
+        current_modality == "MRI"
+        and current_file_type == "PNG/JPG"
+        and current_files
+    ):
+        load_current_image(current_slice_index)
+
+
 
 def update_ct_mri_analysis_availability() -> None:
+
     reset_ct_result()
     reset_mri_result()
-    ct_supported = current_modality == "CT" and current_file_type == "PNG/JPG"
-    mri_supported = current_modality == "MRI" and current_file_type == "PNG/JPG"
-    ct_analysis_panel.set_visibility(ct_supported)
-    mri_analysis_panel.set_visibility(mri_supported)
+
+    # --------------------------------------------------------
+    # CT SUPPORT
+    # PNG/JPG + DICOM
+    # --------------------------------------------------------
+
+    ct_supported = (
+        current_modality == "CT"
+        and current_file_type in {
+            "PNG/JPG",
+            "DICOM",
+        }
+    )
+
+    # --------------------------------------------------------
+    # MRI
+    # DICOM support will be added in the next stage.
+    # --------------------------------------------------------
+
+    mri_supported = (
+        current_modality == "MRI"
+        and current_file_type in {
+            "PNG/JPG",
+            "DICOM",
+        }
+    )
+
+
+    ct_analysis_panel.set_visibility(
+        ct_supported
+    )
+
+    mri_analysis_panel.set_visibility(
+        mri_supported
+    )
+
 
     if ct_supported:
-        ct_status_label.set_text("Status: Ready for CT classification.")
+
+        if current_file_type == "DICOM":
+
+            ct_status_label.set_text(
+                "Status: Ready for CT DICOM analysis."
+            )
+
+        else:
+
+            ct_status_label.set_text(
+                "Status: Ready for CT analysis."
+            )
+
         ct_analysis_button.enable()
+
     else:
+
         ct_analysis_button.disable()
 
+
     if mri_supported:
-        mri_status_label.set_text("Status: Ready for brain MRI classification.")
+
+        mri_status_label.set_text(
+            "Status: Ready for brain MRI classification."
+        )
+
         mri_analysis_button.enable()
+
     else:
+
         mri_analysis_button.disable()
+
+
+
+
+
+def _ct_localization_passes_demo_filter(
+    localization,
+    image_width: int = 512,
+    image_height: int = 512,
+) -> tuple[bool, str]:
+    """
+    Apply conservative demo-only checks before displaying a
+    CT infection localization.
+
+    This does not establish whether a finding is clinically real.
+    It only rejects obvious edge/body-table style predictions.
+    """
+
+    if not localization.get(
+        "has_detected_region",
+        False,
+    ):
+        return (
+            False,
+            "No region predicted",
+        )
+
+    box = localization.get(
+        "bounding_box"
+    )
+
+    if not box:
+        return (
+            False,
+            "No bounding box returned",
+        )
+
+    x1 = int(
+        box.get(
+            "x",
+            0,
+        )
+    )
+
+    y1 = int(
+        box.get(
+            "y",
+            0,
+        )
+    )
+
+    width = int(
+        box.get(
+            "width",
+            0,
+        )
+    )
+
+    height = int(
+        box.get(
+            "height",
+            0,
+        )
+    )
+
+    x2 = int(
+        box.get(
+            "x2",
+            x1 + width,
+        )
+    )
+
+    y2 = int(
+        box.get(
+            "y2",
+            y1 + height,
+        )
+    )
+
+    coverage = float(
+        localization.get(
+            "lesion_coverage",
+            0.0,
+        )
+        or 0.0
+    )
+
+    mean_probability = float(
+        localization.get(
+            "mean_region_probability",
+            0.0,
+        )
+        or 0.0
+    )
+
+    # --------------------------------------------------------
+    # INVALID BOX
+    # --------------------------------------------------------
+
+    if width <= 0 or height <= 0:
+        return (
+            False,
+            "Invalid bounding box",
+        )
+
+    # --------------------------------------------------------
+    # VERY TINY PREDICTION
+    # --------------------------------------------------------
+
+    if coverage < 0.001:
+        return (
+            False,
+            "Predicted region is extremely small",
+        )
+
+    # --------------------------------------------------------
+    # VERY LOW SEGMENTATION CONFIDENCE
+    # --------------------------------------------------------
+
+    if mean_probability < 0.55:
+        return (
+            False,
+            "Segmentation probability is too low",
+        )
+
+    # --------------------------------------------------------
+    # IMAGE EDGE CHECKS
+    # --------------------------------------------------------
+
+    left_margin = int(
+        image_width * 0.01
+    )
+
+    right_margin = int(
+        image_width * 0.99
+    )
+
+    top_margin = int(
+        image_height * 0.01
+    )
+
+    if (
+        x2 <= left_margin
+        or x1 >= right_margin
+        or y2 <= top_margin
+    ):
+        return (
+            False,
+            "Prediction is located at the image edge",
+        )
+
+    # --------------------------------------------------------
+    # POSTERIOR / BODY-TABLE STYLE FALSE-POSITIVE CHECK
+    #
+    # A small horizontal region very low in the image is
+    # treated as suspicious for this research/demo viewer.
+    # --------------------------------------------------------
+
+    center_y = (
+        y1 + y2
+    ) / 2.0
+
+    lower_region_limit = (
+        image_height * 0.76
+    )
+
+    small_vertical_height = (
+        image_height * 0.10
+    )
+
+    if (
+        center_y > lower_region_limit
+        and height < small_vertical_height
+    ):
+        return (
+            False,
+            "Prediction is a small posterior/bottom-edge region",
+        )
+
+    return (
+        True,
+        "Localization passed demo validity checks",
+    )
+
+
+
+
+def _ct_dicom_is_supported_anatomy(dicom_path):
+    """
+    Research/demo safety gate for the chest/COVID CT model.
+
+    The model should only run when chest/lung anatomy can be
+    reasonably established from DICOM metadata.
+    """
+
+    try:
+        import pydicom
+
+        ds = pydicom.dcmread(
+            str(dicom_path),
+            stop_before_pixels=True,
+            force=True,
+        )
+
+    except Exception as error:
+        return {
+            "supported": False,
+            "reason": (
+                "Unable to inspect DICOM metadata: "
+                f"{error}"
+            ),
+        }
+
+    modality = str(
+        getattr(
+            ds,
+            "Modality",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    body_part = str(
+        getattr(
+            ds,
+            "BodyPartExamined",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    study_description = str(
+        getattr(
+            ds,
+            "StudyDescription",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    series_description = str(
+        getattr(
+            ds,
+            "SeriesDescription",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    protocol_name = str(
+        getattr(
+            ds,
+            "ProtocolName",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    metadata_text = " ".join(
+        [
+            body_part,
+            study_description,
+            series_description,
+            protocol_name,
+        ]
+    )
+
+    if modality and modality != "CT":
+        return {
+            "supported": False,
+            "reason": (
+                f"DICOM modality is {modality}, not CT."
+            ),
+        }
+
+    unsupported_terms = [
+        "PELVIS",
+        "PELVIC",
+        "ABDOMEN",
+        "ABDOMINAL",
+        "HEAD",
+        "BRAIN",
+        "SKULL",
+        "NECK",
+        "CERVICAL",
+        "SPINE",
+        "LUMBAR",
+        "HIP",
+        "KNEE",
+        "LEG",
+        "FOOT",
+        "ANKLE",
+        "ARM",
+        "HAND",
+        "WRIST",
+        "SHOULDER",
+        "EXTREMITY",
+    ]
+
+    for term in unsupported_terms:
+        if term in metadata_text:
+            return {
+                "supported": False,
+                "reason": (
+                    "This CT appears to contain "
+                    f"{term.lower()} anatomy. "
+                    "The COVID CT model is restricted "
+                    "to chest/lung CT."
+                ),
+            }
+
+    supported_terms = [
+        "CHEST",
+        "THORAX",
+        "THORACIC",
+        "LUNG",
+        "PULMONARY",
+    ]
+
+    for term in supported_terms:
+        if term in metadata_text:
+            return {
+                "supported": True,
+                "reason": (
+                    "Chest/lung anatomy identified "
+                    f"from DICOM metadata ({term})."
+                ),
+            }
+
+    return {
+        "supported": False,
+        "reason": (
+            "Chest/lung anatomy could not be confirmed "
+            "from this DICOM. CT AI was not run."
+        ),
+    }
 
 
 def run_ct_classification() -> None:
-    if current_modality != "CT" or current_file_type != "PNG/JPG" or not current_files:
-        ui.notify("Load a CT PNG/JPG image first.", type="warning")
+    """
+    Run CT classification and infection localization.
+
+    Supported inputs:
+        CT PNG/JPG
+        CT DICOM
+    """
+
+    # ========================================================
+    # VALIDATION
+    # ========================================================
+
+    if current_modality != "CT":
+
+        ui.notify(
+            "CT analysis is available only for CT images.",
+            type="warning",
+        )
+
         return
-    selected_file = current_files[current_slice_index]
+
+
+    if current_file_type not in {
+        "PNG/JPG",
+        "DICOM",
+    }:
+
+        ui.notify(
+            "Load a CT PNG/JPG or DICOM image first.",
+            type="warning",
+        )
+
+        return
+
+
+    if not current_files:
+
+        ui.notify(
+            "No CT image is currently loaded.",
+            type="warning",
+        )
+
+        return
+
+
+    selected_file = current_files[
+        current_slice_index
+    ]
+
+
+    # --------------------------------------------------------
+    # CT DICOM IMAGE-CONTENT LUNG GATE
+    # --------------------------------------------------------
+
+    if current_file_type == "DICOM":
+
+        lung_check = check_ct_lung_content(
+            selected_file
+        )
+
+        if not lung_check["supported"]:
+
+            ct_status_label.set_text(
+                "Status: CT AI not applicable to this slice."
+            )
+
+            ct_prediction_label.set_text(
+                "Prediction: Not run"
+            )
+
+            ct_noncovid_label.set_text(
+                "NonCOVID probability: --"
+            )
+
+            ct_covid_label.set_text(
+                "COVID probability: --"
+            )
+
+            ct_confidence_label.set_text(
+                "Model confidence: --"
+            )
+
+            ct_confidence_level_label.set_text(
+                "Confidence level: --"
+            )
+
+            ct_localization_status_label.set_text(
+                "Infection localization: Not run"
+            )
+
+            ct_localization_coverage_label.set_text(
+                "Predicted infection coverage: --"
+            )
+
+            ct_localization_probability_label.set_text(
+                "Mean segmentation probability: --"
+            )
+
+            ct_localization_bbox_label.set_text(
+                "Bounding box: --"
+            )
+
+            viewer_status_label.set_text(
+                "CT AI blocked: "
+                + lung_check["reason"]
+            )
+
+            ui.notify(
+                lung_check["reason"],
+                type="warning",
+                position="top",
+            )
+
+            return
+
+
+
+    # --------------------------------------------------------
+    # CT DICOM ANATOMY SAFETY GATE
+    # --------------------------------------------------------
+
+    if current_file_type == "DICOM":
+
+        anatomy_check = (
+            _ct_dicom_is_supported_anatomy(
+                selected_file
+            )
+        )
+
+        if not anatomy_check["supported"]:
+
+            ct_status_label.set_text(
+                "Status: CT AI not applicable to this DICOM."
+            )
+
+            ct_prediction_label.set_text(
+                "Prediction: Not run"
+            )
+
+            ct_noncovid_label.set_text(
+                "NonCOVID probability: --"
+            )
+
+            ct_covid_label.set_text(
+                "COVID probability: --"
+            )
+
+            ct_confidence_label.set_text(
+                "Model confidence: --"
+            )
+
+            ct_confidence_level_label.set_text(
+                "Confidence level: --"
+            )
+
+            ct_localization_status_label.set_text(
+                "Infection localization: Not run"
+            )
+
+            ct_localization_coverage_label.set_text(
+                "Predicted infection coverage: --"
+            )
+
+            ct_localization_probability_label.set_text(
+                "Mean segmentation probability: --"
+            )
+
+            ct_localization_bbox_label.set_text(
+                "Bounding box: --"
+            )
+
+            viewer_status_label.set_text(
+                "CT AI not run: "
+                + anatomy_check["reason"]
+            )
+
+            ui.notify(
+                anatomy_check["reason"],
+                type="warning",
+                position="top",
+            )
+
+            return
+
+
+    temporary_png = None
+
+
     try:
-        ct_status_label.set_text("Status: Running classification...")
+
         ct_analysis_button.disable()
-        result = ct_classifier.predict(selected_file)
-        noncovid = float(result["noncovid_probability"])
-        covid = float(result["covid_probability"])
-        confidence = float(result["confidence"])
-        ct_prediction_label.set_text(f"Prediction: {result['prediction']}")
-        ct_noncovid_label.set_text(f"NonCOVID probability: {noncovid * 100:.1f}%")
-        ct_covid_label.set_text(f"COVID probability: {covid * 100:.1f}%")
+
+        ct_status_label.set_text(
+            "Status: Preparing CT image for AI analysis..."
+        )
+
+
+        # ====================================================
+        # PREPARE MODEL INPUT
+        # ====================================================
+
+        if current_file_type == "DICOM":
+
+            ct_status_label.set_text(
+                "Status: Converting CT DICOM for AI analysis..."
+            )
+
+
+            bridge_result = dicom_to_temporary_png(
+                dicom_path=selected_file,
+                frame_index=0,
+                modality_override="CT",
+            )
+
+
+            temporary_png = bridge_result[
+                "temporary_png"
+            ]
+
+
+            model_input = temporary_png
+
+
+        else:
+
+            model_input = selected_file
+
+
+        # ====================================================
+        # CT CLASSIFICATION
+        # ====================================================
+
+        ct_status_label.set_text(
+            "Status: Running CT classification..."
+        )
+
+
+        result = ct_classifier.predict(
+            model_input
+        )
+
+
+        noncovid = float(
+            result[
+                "noncovid_probability"
+            ]
+        )
+
+
+        covid = float(
+            result[
+                "covid_probability"
+            ]
+        )
+
+
+        confidence = float(
+            result[
+                "confidence"
+            ]
+        )
+
+
+        ct_prediction_label.set_text(
+            f"Prediction: {result['prediction']}"
+        )
+
+
+        ct_noncovid_label.set_text(
+            "NonCOVID probability: "
+            f"{noncovid * 100:.1f}%"
+        )
+
+
+        ct_covid_label.set_text(
+            "COVID probability: "
+            f"{covid * 100:.1f}%"
+        )
+
+
         ct_noncovid_progress.value = noncovid
         ct_covid_progress.value = covid
+
+
         ct_noncovid_progress.update()
         ct_covid_progress.update()
-        ct_confidence_label.set_text(f"Model confidence: {confidence * 100:.1f}%")
-        ct_confidence_level_label.set_text(f"Confidence level: {_confidence_level(confidence)}")
-        ct_threshold_label.set_text(f"Decision threshold: {result['threshold']:.2f}")
-        ct_status_label.set_text("Status: Classification complete.")
+
+
+        ct_confidence_label.set_text(
+            "Model confidence: "
+            f"{confidence * 100:.1f}%"
+        )
+
+
+        ct_confidence_level_label.set_text(
+            "Confidence level: "
+            f"{_confidence_level(confidence)}"
+        )
+
+
+        ct_threshold_label.set_text(
+            "Decision threshold: "
+            f"{result['threshold']:.2f}"
+        )
+
+
+        # ====================================================
+        # CT INFECTION LOCALIZATION
+        # ====================================================
+
+        ct_status_label.set_text(
+            "Status: Running CT infection localization..."
+        )
+
+
+        localization = segment_ct(
+            model_input
+        )
+
+
+        # ====================================================
+        # REGION DETECTED
+        # ====================================================
+
+        localization_valid, localization_reason = (
+            _ct_localization_passes_demo_filter(
+                localization,
+                image_width=512,
+                image_height=512,
+            )
+        )
+
+        if localization_valid:
+
+            ct_localization_status_label.set_text(
+                "Infection localization: "
+                "Predicted region detected"
+            )
+
+
+            lesion_coverage = float(
+                localization[
+                    "lesion_coverage"
+                ]
+            )
+
+
+            mean_probability = float(
+                localization[
+                    "mean_region_probability"
+                ]
+            )
+
+
+            maximum_probability = float(
+                localization[
+                    "maximum_probability"
+                ]
+            )
+
+
+            ct_localization_coverage_label.set_text(
+                "Predicted infection coverage: "
+                f"{lesion_coverage * 100:.2f}%"
+            )
+
+
+            ct_localization_probability_label.set_text(
+                "Mean segmentation probability: "
+                f"{mean_probability * 100:.2f}%"
+            )
+
+
+            box = localization[
+                "bounding_box"
+            ]
+
+
+            ct_localization_bbox_label.set_text(
+                "Bounding box: "
+                f"x={box['x']}, "
+                f"y={box['y']}, "
+                f"width={box['width']}, "
+                f"height={box['height']}"
+            )
+
+
+            # ================================================
+            # SHOW LOCALIZATION DIRECTLY IN MAIN VIEWER
+            # ================================================
+
+            viewer_image.set_source(
+                image_to_data_url(
+                    localization[
+                        "overlay"
+                    ]
+                )
+            )
+
+
+            viewer_status_label.set_text(
+                "CT AI localization displayed"
+            )
+
+
+        # ====================================================
+        # NO REGION DETECTED
+        # ====================================================
+
+        else:
+
+            ct_localization_status_label.set_text(
+                "Infection localization: "
+                "No reliable region displayed"
+            )
+
+
+            ct_localization_coverage_label.set_text(
+                "Predicted infection coverage: "
+                "0.00%"
+            )
+
+
+            ct_localization_probability_label.set_text(
+                "Mean segmentation probability: "
+                "0.00%"
+            )
+
+
+            ct_localization_bbox_label.set_text(
+                "Bounding box: Not displayed"
+            )
+
+            viewer_status_label.set_text(
+                "CT localization filtered: "
+                f"{localization_reason}"
+            )
+
+
+        # ====================================================
+        # COMPLETE
+        # ====================================================
+
+        if current_file_type == "DICOM":
+
+            ct_status_label.set_text(
+                "Status: CT DICOM analysis complete."
+            )
+
+        else:
+
+            ct_status_label.set_text(
+                "Status: CT analysis complete."
+            )
+
+
     except Exception as error:
-        ct_status_label.set_text("Status: Classification failed.")
-        ui.notify(f"Unable to run CT classification: {error}", type="negative", position="top")
+
+        ct_status_label.set_text(
+            "Status: CT analysis failed."
+        )
+
+
+        ui.notify(
+            f"Unable to run CT analysis: {error}",
+            type="negative",
+            position="top",
+        )
+
+
     finally:
+
+        # ----------------------------------------------------
+        # DELETE TEMPORARY DICOM PNG
+        # ----------------------------------------------------
+
+        if temporary_png is not None:
+
+            cleanup_temporary_ai_image(
+                temporary_png
+            )
+
+
         ct_analysis_button.enable()
 
 
-def run_mri_classification() -> None:
-    if current_modality != "MRI" or current_file_type != "PNG/JPG" or not current_files:
-        ui.notify("Load a brain MRI PNG/JPG image first.", type="warning")
-        return
-    selected_file = current_files[current_slice_index]
+
+
+
+def _mri_dicom_is_brain_anatomy(dicom_path):
+    """
+    Research/demo safety gate for the current brain MRI models.
+    """
+
     try:
-        mri_status_label.set_text("Status: Running classification...")
+        import pydicom
+
+        dataset = pydicom.dcmread(
+            str(dicom_path),
+            stop_before_pixels=True,
+            force=True,
+        )
+
+    except Exception as error:
+
+        return {
+            "supported": False,
+            "reason": (
+                "Unable to inspect MRI DICOM metadata: "
+                f"{error}"
+            ),
+        }
+
+    modality = str(
+        getattr(
+            dataset,
+            "Modality",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    body_part = str(
+        getattr(
+            dataset,
+            "BodyPartExamined",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    study = str(
+        getattr(
+            dataset,
+            "StudyDescription",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    series = str(
+        getattr(
+            dataset,
+            "SeriesDescription",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    protocol = str(
+        getattr(
+            dataset,
+            "ProtocolName",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    metadata = " ".join(
+        [
+            body_part,
+            study,
+            series,
+            protocol,
+        ]
+    )
+
+    if modality not in {
+        "MR",
+        "MRI",
+    }:
+
+        return {
+            "supported": False,
+            "reason": (
+                f"DICOM modality is {modality}, not MRI."
+            ),
+        }
+
+    blocked_terms = [
+        "ABDOMEN",
+        "ABDOMINAL",
+        "PELVIS",
+        "PELVIC",
+        "CHEST",
+        "THORAX",
+        "LIVER",
+        "KIDNEY",
+        "SPINE",
+        "LUMBAR",
+        "CERVICAL",
+        "KNEE",
+        "HIP",
+        "SHOULDER",
+        "ANKLE",
+        "FOOT",
+        "ARM",
+        "LEG",
+    ]
+
+    for term in blocked_terms:
+
+        if term in metadata:
+
+            return {
+                "supported": False,
+                "reason": (
+                    "This MRI appears to contain "
+                    f"{term.lower()} anatomy. "
+                    "The current AI models are restricted "
+                    "to brain MRI."
+                ),
+            }
+
+    brain_terms = [
+        "BRAIN",
+        "HEAD",
+        "CRANIAL",
+        "CRANIUM",
+        "CEREBRAL",
+        "GLIOMA",
+        "FLAIR",
+    ]
+
+    for term in brain_terms:
+
+        if term in metadata:
+
+            return {
+                "supported": True,
+                "reason": (
+                    "Brain/head MRI identified "
+                    f"from DICOM metadata ({term})."
+                ),
+            }
+
+    return {
+        "supported": False,
+        "reason": (
+            "Brain/head anatomy could not be confirmed "
+            "from this MRI DICOM. "
+            "Brain-tumor AI was not run."
+        ),
+    }
+
+
+def run_mri_classification() -> None:
+    """
+    Run brain MRI classification and tumor localization.
+
+    Supported input:
+        - MRI PNG/JPG
+        - brain/head MRI DICOM
+    """
+
+    if current_modality != "MRI":
+
+        ui.notify(
+            "MRI analysis is available only for MRI images.",
+            type="warning",
+        )
+
+        return
+
+
+    if current_file_type not in {
+        "PNG/JPG",
+        "DICOM",
+    }:
+
+        ui.notify(
+            "Load a brain MRI PNG/JPG or DICOM image first.",
+            type="warning",
+        )
+
+        return
+
+
+    if not current_files:
+
+        ui.notify(
+            "No MRI image is currently loaded.",
+            type="warning",
+        )
+
+        return
+
+
+    selected_file = current_files[
+        current_slice_index
+    ]
+
+
+    temporary_mri_png = None
+    model_input = selected_file
+
+
+    # ========================================================
+    # MRI DICOM PREPARATION
+    # ========================================================
+
+    if current_file_type == "DICOM":
+
+        anatomy_check = (
+            _mri_dicom_is_brain_anatomy(
+                selected_file
+            )
+        )
+
+
+        if not anatomy_check[
+            "supported"
+        ]:
+
+            mri_status_label.set_text(
+                "Status: Brain MRI AI not applicable "
+                "to this DICOM."
+            )
+
+
+            mri_prediction_label.set_text(
+                "Prediction: Not run"
+            )
+
+
+            mri_meningioma_label.set_text(
+                "Meningioma probability: --"
+            )
+
+
+            mri_glioma_label.set_text(
+                "Glioma probability: --"
+            )
+
+
+            mri_pituitary_label.set_text(
+                "Pituitary probability: --"
+            )
+
+
+            mri_confidence_label.set_text(
+                "Model confidence: --"
+            )
+
+
+            mri_confidence_level_label.set_text(
+                "Confidence level: --"
+            )
+
+
+            mri_localization_status_label.set_text(
+                "Tumor localization: Not run"
+            )
+
+
+            mri_localization_coverage_label.set_text(
+                "Predicted region coverage: --"
+            )
+
+
+            mri_localization_probability_label.set_text(
+                "Mean segmentation probability: --"
+            )
+
+
+            mri_localization_bbox_label.set_text(
+                "Bounding box: --"
+            )
+
+
+            mri_localization_image.set_visibility(
+                False
+            )
+
+
+            viewer_status_label.set_text(
+                "MRI AI blocked: "
+                + anatomy_check["reason"]
+            )
+
+
+            ui.notify(
+                anatomy_check[
+                    "reason"
+                ],
+                type="warning",
+                position="top",
+            )
+
+            return
+
+
+        try:
+
+            bridge_result = (
+                dicom_to_temporary_png(
+                    dicom_path=selected_file,
+                    frame_index=0,
+                    modality_override="MR",
+                )
+            )
+
+
+            temporary_mri_png = (
+                bridge_result[
+                    "temporary_png"
+                ]
+            )
+
+
+            model_input = (
+                temporary_mri_png
+            )
+
+
+        except Exception as error:
+
+            mri_status_label.set_text(
+                "Status: MRI DICOM conversion failed."
+            )
+
+            ui.notify(
+                f"Unable to prepare MRI DICOM: {error}",
+                type="negative",
+                position="top",
+            )
+
+            return
+
+
+    # ========================================================
+    # MRI ANALYSIS
+    # ========================================================
+
+    try:
+
+        mri_status_label.set_text(
+            "Status: Running MRI classification "
+            "and tumor localization..."
+        )
+
+
         mri_analysis_button.disable()
-        result = mri_classifier.predict(selected_file)
-        meningioma = float(result["meningioma_probability"])
-        glioma = float(result["glioma_probability"])
-        pituitary = float(result["pituitary_probability"])
-        confidence = float(result["confidence"])
-        mri_prediction_label.set_text(f"Prediction: {result['prediction']}")
-        mri_meningioma_label.set_text(f"Meningioma probability: {meningioma * 100:.1f}%")
-        mri_glioma_label.set_text(f"Glioma probability: {glioma * 100:.1f}%")
-        mri_pituitary_label.set_text(f"Pituitary probability: {pituitary * 100:.1f}%")
-        mri_meningioma_progress.value = meningioma
-        mri_glioma_progress.value = glioma
-        mri_pituitary_progress.value = pituitary
+
+
+        # ====================================================
+        # CLASSIFICATION
+        # ====================================================
+
+        result = mri_classifier.predict(
+            model_input
+        )
+
+
+        meningioma = float(
+            result[
+                "meningioma_probability"
+            ]
+        )
+
+
+        glioma = float(
+            result[
+                "glioma_probability"
+            ]
+        )
+
+
+        pituitary = float(
+            result[
+                "pituitary_probability"
+            ]
+        )
+
+
+        confidence = float(
+            result[
+                "confidence"
+            ]
+        )
+
+
+        mri_prediction_label.set_text(
+            f"Prediction: {result['prediction']}"
+        )
+
+
+        mri_meningioma_label.set_text(
+            "Meningioma probability: "
+            f"{meningioma * 100:.1f}%"
+        )
+
+
+        mri_glioma_label.set_text(
+            "Glioma probability: "
+            f"{glioma * 100:.1f}%"
+        )
+
+
+        mri_pituitary_label.set_text(
+            "Pituitary probability: "
+            f"{pituitary * 100:.1f}%"
+        )
+
+
+        mri_meningioma_progress.value = (
+            meningioma
+        )
+
+
+        mri_glioma_progress.value = (
+            glioma
+        )
+
+
+        mri_pituitary_progress.value = (
+            pituitary
+        )
+
+
         mri_meningioma_progress.update()
         mri_glioma_progress.update()
         mri_pituitary_progress.update()
-        mri_confidence_label.set_text(f"Model confidence: {confidence * 100:.1f}%")
-        mri_confidence_level_label.set_text(f"Confidence level: {_confidence_level(confidence)}")
-        mri_status_label.set_text("Status: Classification complete.")
+
+
+        mri_confidence_label.set_text(
+            "Model confidence: "
+            f"{confidence * 100:.1f}%"
+        )
+
+
+        mri_confidence_level_label.set_text(
+            "Confidence level: "
+            f"{_confidence_level(confidence)}"
+        )
+
+
+        # ====================================================
+        # TUMOR LOCALIZATION
+        # ====================================================
+
+        try:
+
+            localization = segment_mri(
+                model_input
+            )
+
+
+            if localization[
+                "has_detected_region"
+            ]:
+
+                mri_localization_status_label.set_text(
+                    "Tumor localization: "
+                    "Predicted region detected"
+                )
+
+
+                mri_localization_coverage_label.set_text(
+                    "Predicted region coverage: "
+                    f"{float(localization['lesion_coverage']) * 100:.2f}%"
+                )
+
+
+                mri_localization_probability_label.set_text(
+                    "Mean segmentation probability: "
+                    f"{float(localization['mean_region_probability']) * 100:.2f}%"
+                )
+
+
+                box = (
+                    localization.get(
+                        "bounding_box"
+                    )
+                    or {}
+                )
+
+
+                mri_localization_bbox_label.set_text(
+                    "Bounding box: "
+                    f"x={box.get('x', '--')}, "
+                    f"y={box.get('y', '--')}, "
+                    f"width={box.get('width', '--')}, "
+                    f"height={box.get('height', '--')}"
+                )
+
+
+                viewer_image.set_source(
+                    image_to_data_url(
+                        localization[
+                            "overlay"
+                        ]
+                    )
+                )
+
+
+                mri_localization_image.set_visibility(
+                    False
+                )
+
+
+            else:
+
+                mri_localization_status_label.set_text(
+                    "Tumor localization: "
+                    "No region detected above "
+                    "the segmentation threshold"
+                )
+
+
+                mri_localization_coverage_label.set_text(
+                    "Predicted region coverage: "
+                    "0.00%"
+                )
+
+
+                mri_localization_probability_label.set_text(
+                    "Maximum segmentation probability: "
+                    f"{float(localization['maximum_probability']) * 100:.2f}%"
+                )
+
+
+                mri_localization_bbox_label.set_text(
+                    "Bounding box: None"
+                )
+
+
+                mri_localization_image.set_visibility(
+                    False
+                )
+
+
+        except Exception as localization_error:
+
+            mri_localization_status_label.set_text(
+                "Tumor localization: Unavailable"
+            )
+
+
+            mri_localization_coverage_label.set_text(
+                "Predicted region coverage: --"
+            )
+
+
+            mri_localization_probability_label.set_text(
+                "Mean segmentation probability: --"
+            )
+
+
+            mri_localization_bbox_label.set_text(
+                "Bounding box: --"
+            )
+
+
+            mri_localization_image.set_visibility(
+                False
+            )
+
+
+            ui.notify(
+                "MRI classification completed, "
+                "but localization failed: "
+                f"{localization_error}",
+                type="warning",
+                position="top",
+            )
+
+
+        # ====================================================
+        # COMPLETE
+        # ====================================================
+
+        if current_file_type == "DICOM":
+
+            mri_status_label.set_text(
+                "Status: MRI DICOM analysis complete."
+            )
+
+        else:
+
+            mri_status_label.set_text(
+                "Status: MRI analysis complete."
+            )
+
+
     except Exception as error:
-        mri_status_label.set_text("Status: Classification failed.")
-        ui.notify(f"Unable to run MRI classification: {error}", type="negative", position="top")
+
+        mri_status_label.set_text(
+            "Status: MRI analysis failed."
+        )
+
+
+        ui.notify(
+            f"Unable to run MRI analysis: {error}",
+            type="negative",
+            position="top",
+        )
+
+
     finally:
+
+        if temporary_mri_png is not None:
+
+            cleanup_temporary_ai_image(
+                temporary_mri_png
+            )
+
+
         mri_analysis_button.enable()
+
 
 
 # ---------------------------------------------------------
@@ -1553,6 +3061,355 @@ def run_ultrasound_classification() -> None:
         )
 
     finally:
+        if bool(confirm_thyroid_checkbox.value):
+            classification_button.enable()
+
+
+
+
+# =========================================================
+# ULTRASOUND YOLO INTEGRATION
+# =========================================================
+
+def reset_ultrasound_localization() -> None:
+    """Clear YOLO localization and restore the original image."""
+
+    try:
+        ultrasound_localization_status_label.set_text(
+            "Lesion localization: Not run"
+        )
+
+        ultrasound_localization_confidence_label.set_text(
+            "YOLO detection confidence: --"
+        )
+
+        ultrasound_localization_bbox_label.set_text(
+            "Bounding box: --"
+        )
+
+        ultrasound_localization_coverage_label.set_text(
+            "Predicted lesion coverage: --"
+        )
+
+        ultrasound_detection_count_label.set_text(
+            "YOLO detections: --"
+        )
+
+        if (
+            current_modality == "Ultrasound"
+            and current_file_type == "PNG/JPG"
+            and current_files
+        ):
+            load_current_image(
+                current_slice_index
+            )
+
+    except Exception as error:
+        ui.notify(
+            f"Unable to reset ultrasound localization: {error}",
+            type="negative",
+            position="top",
+        )
+
+
+def run_ultrasound_analysis() -> None:
+    """
+    Run the existing TN5000 classifier and then
+    YOLO thyroid-lesion localization.
+    """
+
+    if current_modality != "Ultrasound":
+        ui.notify(
+            "Ultrasound analysis is available only for ultrasound images.",
+            type="warning",
+        )
+        return
+
+    if current_file_type != "PNG/JPG":
+        ui.notify(
+            "Load a thyroid ultrasound PNG/JPG image first.",
+            type="warning",
+        )
+        return
+
+    if not bool(confirm_thyroid_checkbox.value):
+        ui.notify(
+            "Confirm that the current image is a thyroid ultrasound image first.",
+            type="warning",
+        )
+        return
+
+    if not current_files:
+        ui.notify(
+            "No ultrasound image is currently loaded.",
+            type="warning",
+        )
+        return
+
+    selected_file = current_files[
+        current_slice_index
+    ]
+
+    # ========================================================
+    # EXISTING CLASSIFICATION
+    # ========================================================
+
+    run_ultrasound_classification()
+
+    # ========================================================
+    # YOLO LOCALIZATION
+    # ========================================================
+
+    try:
+
+        classification_status_label.set_text(
+            "Status: Running YOLO lesion localization..."
+        )
+
+        classification_button.disable()
+
+        localization = ultrasound_yolo_detector.predict(
+            selected_file,
+            confidence_threshold=0.25,
+        )
+
+        # ====================================================
+        # LESION DETECTED
+        # ====================================================
+
+        if localization["detected"]:
+
+            box = localization["bbox"]
+
+            ultrasound_localization_status_label.set_text(
+                "Lesion localization: Detected"
+            )
+
+            ultrasound_localization_confidence_label.set_text(
+                "YOLO detection confidence: "
+                f"{localization['confidence_percent']:.1f}%"
+            )
+
+            ultrasound_localization_bbox_label.set_text(
+                "Bounding box: "
+                f"x={box['x']}, "
+                f"y={box['y']}, "
+                f"width={box['width']}, "
+                f"height={box['height']}"
+            )
+
+            ultrasound_localization_coverage_label.set_text(
+                "Predicted lesion coverage: "
+                f"{localization['coverage_percent']:.2f}%"
+            )
+
+            ultrasound_detection_count_label.set_text(
+                "YOLO detections: "
+                f"{localization['number_of_detections']}"
+            )
+
+            # =================================================
+            # LOAD ORIGINAL ULTRASOUND IMAGE
+            # =================================================
+
+            original_image = Image.open(
+                selected_file
+            ).convert(
+                "RGB"
+            )
+
+            overlay_array = np.asarray(
+                original_image
+            ).copy()
+
+            image_height = int(
+                overlay_array.shape[0]
+            )
+
+            image_width = int(
+                overlay_array.shape[1]
+            )
+
+            # =================================================
+            # GET AND CLAMP YOLO BOX
+            # =================================================
+
+            x1 = max(
+                0,
+                min(
+                    int(box["x"]),
+                    image_width - 1,
+                ),
+            )
+
+            y1 = max(
+                0,
+                min(
+                    int(box["y"]),
+                    image_height - 1,
+                ),
+            )
+
+            x2 = max(
+                x1 + 1,
+                min(
+                    int(box["x2"]),
+                    image_width,
+                ),
+            )
+
+            y2 = max(
+                y1 + 1,
+                min(
+                    int(box["y2"]),
+                    image_height,
+                ),
+            )
+
+            # =================================================
+            # HIGHLIGHT DETECTED LESION
+            # =================================================
+
+            if x2 > x1 and y2 > y1:
+
+                overlay_float = overlay_array.astype(
+                    np.float32
+                )
+
+                region = overlay_float[
+                    y1:y2,
+                    x1:x2,
+                ]
+
+                highlight = np.array(
+                    [
+                        255,
+                        70,
+                        40,
+                    ],
+                    dtype=np.float32,
+                )
+
+                overlay_float[
+                    y1:y2,
+                    x1:x2,
+                ] = (
+                    region * 0.80
+                    + highlight * 0.20
+                )
+
+                overlay_array = np.clip(
+                    overlay_float,
+                    0,
+                    255,
+                ).astype(
+                    np.uint8
+                )
+
+                # =============================================
+                # DRAW WHITE BOUNDING-BOX BORDER
+                # =============================================
+
+                border = 4
+
+                overlay_array[
+                    y1:min(
+                        y1 + border,
+                        y2,
+                    ),
+                    x1:x2,
+                ] = 255
+
+                overlay_array[
+                    max(
+                        y2 - border,
+                        y1,
+                    ):y2,
+                    x1:x2,
+                ] = 255
+
+                overlay_array[
+                    y1:y2,
+                    x1:min(
+                        x1 + border,
+                        x2,
+                    ),
+                ] = 255
+
+                overlay_array[
+                    y1:y2,
+                    max(
+                        x2 - border,
+                        x1,
+                    ):x2,
+                ] = 255
+
+            # =================================================
+            # SHOW RESULT IN MAIN VIEWER
+            # =================================================
+
+            viewer_image.set_source(
+                image_to_data_url(
+                    overlay_array
+                )
+            )
+
+            classification_status_label.set_text(
+                "Status: Ultrasound classification "
+                "and YOLO localization complete."
+            )
+
+        # ====================================================
+        # NO LESION DETECTED
+        # ====================================================
+
+        else:
+
+            ultrasound_localization_status_label.set_text(
+                "Lesion localization: No lesion detected"
+            )
+
+            ultrasound_localization_confidence_label.set_text(
+                "YOLO detection confidence: --"
+            )
+
+            ultrasound_localization_bbox_label.set_text(
+                "Bounding box: None"
+            )
+
+            ultrasound_localization_coverage_label.set_text(
+                "Predicted lesion coverage: 0.00%"
+            )
+
+            ultrasound_detection_count_label.set_text(
+                "YOLO detections: 0"
+            )
+
+            classification_status_label.set_text(
+                "Status: Classification complete. "
+                "YOLO did not detect a lesion above "
+                "the confidence threshold."
+            )
+
+    except Exception as error:
+
+        ultrasound_localization_status_label.set_text(
+            "Lesion localization: Failed"
+        )
+
+        classification_status_label.set_text(
+            "Status: Classification completed, "
+            "but YOLO localization failed."
+        )
+
+        ui.notify(
+            f"Unable to run ultrasound YOLO localization: {error}",
+            type="negative",
+            position="top",
+        )
+
+    finally:
+
         if bool(confirm_thyroid_checkbox.value):
             classification_button.enable()
 
@@ -2158,419 +4015,140 @@ with ui.row().classes(
 
     # LEFT PANEL
     with ui.column().classes(
-        "control-panel w-80 "
-        "bg-slate-100 rounded-lg "
-        "p-4 shadow"
+        "control-panel w-80 bg-slate-100 rounded-lg p-3 shadow "
+        "sticky top-16 max-h-[calc(100vh-5rem)] overflow-y-auto"
     ):
-        ui.label(
-            "Viewer Controls"
-        ).classes(
-            "text-xl font-semibold"
-        )
+        ui.label("Viewer Controls").classes("text-xl font-semibold")
+        current_study_label = ui.label("Current Study: Sample CT").classes("text-xs")
+        file_type_label = ui.label("File Type: DICOM").classes("text-xs")
 
-        current_study_label = ui.label(
-            "Current Study: Sample CT"
-        )
+        # Study / Upload
+        with ui.expansion("Study / Upload", icon="folder_open", value=True).classes("w-full"):
+            sample_selector = ui.select(
+                options=["CT", "MRI", "Ultrasound"],
+                value="CT",
+                label="Load Sample Study",
+                on_change=change_sample_modality,
+            ).classes("w-full")
 
-        file_type_label = ui.label(
-            "File Type: DICOM"
-        )
+            ui.label("DICOM Study").classes("font-semibold text-sm")
+            dicom_upload_status_label = ui.label("DICOM files uploaded: 0").classes("text-xs")
+            dicom_upload_control = ui.upload(
+                label="Select DICOM Files",
+                on_upload=handle_dicom_upload,
+                multiple=True,
+                auto_upload=True,
+                max_files=2000,
+            ).props("accept=.dcm,application/dicom").classes("w-full")
+            ui.button(
+                "Process DICOM Study", icon="folder_open", on_click=process_dicom_uploads
+            ).classes("w-full")
+            series_status_label = ui.label("DICOM series detected: 0").classes("text-xs")
+            uploaded_series_selector = ui.select(
+                options=[], label="Select DICOM Series"
+            ).classes("w-full")
+            ui.button("Load DICOM Series", on_click=load_selected_dicom_series).classes("w-full")
 
-        sample_selector = ui.select(
-            options=[
-                "CT",
-                "MRI",
-                "Ultrasound",
-            ],
-            value="CT",
-            label="Load Sample Study",
-            on_change=change_sample_modality,
-        ).classes(
-            "w-full"
-        )
+            ui.separator()
+            ui.label("Single PNG/JPG Image").classes("font-semibold text-sm")
+            standard_upload_status_label = ui.label("No standard image selected").classes("text-xs")
+            standard_upload_control = ui.upload(
+                label="Select One PNG/JPG",
+                on_upload=handle_standard_upload,
+                multiple=False,
+                auto_upload=True,
+                max_files=1,
+            ).props("accept=.png,.jpg,.jpeg,image/png,image/jpeg").classes("w-full")
+            standard_modality_selector = ui.select(
+                options=["CT", "MRI", "Ultrasound"], label="Image Modality"
+            ).classes("w-full")
+            ui.button(
+                "Load Standard Image", icon="image", on_click=load_standard_image_for_viewing
+            ).classes("w-full")
+            ui.button(
+                "Clear Uploaded Files", icon="delete", on_click=clear_uploads
+            ).props("outline").classes("w-full")
 
-        ui.separator()
-
-        ui.label(
-            "Upload Study / Image"
-        ).classes(
-            "text-lg font-semibold"
-        )
-
-        ui.label(
-            "DICOM Study"
-        ).classes(
-            "font-semibold text-slate-700"
-        )
-
-        ui.label(
-            "Choose multiple DICOM slices when they belong to one CT/MRI/US study."
-        ).classes(
-            "text-xs text-gray-600"
-        )
-
-        dicom_upload_status_label = ui.label(
-            "DICOM files uploaded: 0"
-        )
-
-        dicom_upload_control = ui.upload(
-            label="Select DICOM Files",
-            on_upload=handle_dicom_upload,
-            multiple=True,
-            auto_upload=True,
-            max_files=2000,
-        ).props(
-            "accept=.dcm,application/dicom"
-        ).classes(
-            "w-full"
-        )
-
-        ui.button(
-            "Process DICOM Study",
-            icon="folder_open",
-            on_click=process_dicom_uploads,
-        ).classes(
-            "w-full"
-        )
-
-        series_status_label = ui.label(
-            "DICOM series detected: 0"
-        )
-
-        uploaded_series_selector = ui.select(
-            options=[],
-            label="Select DICOM Series",
-        ).classes(
-            "w-full"
-        )
-
-        ui.button(
-            "Load DICOM Series",
-            on_click=load_selected_dicom_series,
-        ).classes(
-            "w-full"
-        )
-
-        ui.separator()
-
-        ui.label(
-            "Single PNG/JPG Image"
-        ).classes(
-            "font-semibold text-slate-700"
-        )
-
-        ui.label(
-            "Use one standard image at a time. Thyroid classification appears only for Ultrasound."
-        ).classes(
-            "text-xs text-gray-600"
-        )
-
-        standard_upload_status_label = ui.label(
-            "No standard image selected"
-        )
-
-        standard_upload_control = ui.upload(
-            label="Select One PNG/JPG",
-            on_upload=handle_standard_upload,
-            multiple=False,
-            auto_upload=True,
-            max_files=1,
-        ).props(
-            "accept=.png,.jpg,.jpeg,image/png,image/jpeg"
-        ).classes(
-            "w-full"
-        )
-
-        standard_modality_selector = ui.select(
-            options=[
-                "CT",
-                "MRI",
-                "Ultrasound",
-            ],
-            label="Image Modality",
-        ).classes(
-            "w-full"
-        )
-
-        ui.button(
-            "Load Standard Image",
-            icon="image",
-            on_click=load_standard_image_for_viewing,
-        ).classes(
-            "w-full"
-        )
-
-        ui.button(
-            "Clear Uploaded Files",
-            icon="delete",
-            on_click=clear_uploads,
-        ).props(
-            "outline"
-        ).classes(
-            "w-full"
-        )
-
-        ui.separator()
-
-        slice_label = ui.label(
-            "Image 1 of 1"
-        )
-
-        slice_slider = ui.slider(
-            min=0,
-            max=0,
-            value=0,
-            step=1,
-            on_change=change_slice,
-        ).classes(
-            "w-full"
-        )
-
-        with ui.row().classes("w-full gap-2"):
-            ui.button("Previous", icon="chevron_left", on_click=previous_slice).classes("flex-1")
-            ui.button("Next", icon="chevron_right", on_click=next_slice).classes("flex-1")
-
-        ui.button("MPR Preview", icon="view_in_ar", on_click=show_mpr_preview).props("outline").classes("w-full")
+        # Navigation / MPR
+        with ui.expansion("Navigation / MPR", icon="view_in_ar", value=True).classes("w-full"):
+            slice_label = ui.label("Image 1 of 1").classes("text-sm")
+            slice_slider = ui.slider(
+                min=0, max=0, value=0, step=1, on_change=change_slice
+            ).classes("w-full")
+            with ui.row().classes("w-full gap-2"):
+                ui.button("Previous", icon="chevron_left", on_click=previous_slice).classes("flex-1")
+                ui.button("Next", icon="chevron_right", on_click=next_slice).classes("flex-1")
+            ui.button(
+                "MPR Preview", icon="view_in_ar", on_click=show_mpr_preview
+            ).props("outline").classes("w-full")
 
         # CT Windowing
-        with ui.column().classes(
-            "w-full gap-2"
-        ) as window_panel:
-            ui.label(
-                "CT Windowing"
-            ).classes(
-                "text-lg font-semibold"
-            )
-
-            with ui.row().classes(
-                "w-full gap-2"
-            ):
-                ui.button(
-                    "Lung",
-                    on_click=lambda:
-                    apply_window_preset(
-                        "Lung"
-                    ),
-                )
-
-                ui.button(
-                    "Soft Tissue",
-                    on_click=lambda:
-                    apply_window_preset(
-                        "Soft Tissue"
-                    ),
-                )
-
-                ui.button(
-                    "Bone",
-                    on_click=lambda:
-                    apply_window_preset(
-                        "Bone"
-                    ),
-                )
-
-                ui.button(
-                    "Brain",
-                    on_click=lambda:
-                    apply_window_preset(
-                        "Brain"
-                    ),
-                )
-
-            window_center_input = ui.number(
-                "Window Center",
-                value=40,
-            ).classes(
-                "w-full"
-            )
-
-            window_width_input = ui.number(
-                "Window Width",
-                value=400,
-                min=1,
-            ).classes(
-                "w-full"
-            )
-
-            ui.button(
-                "Apply Custom Window",
-                on_click=apply_custom_window,
-            ).classes(
-                "w-full"
-            )
-
-        ui.separator()
+        with ui.expansion("CT Windowing", icon="contrast").classes("w-full") as window_panel:
+            with ui.row().classes("w-full gap-1 flex-wrap"):
+                for preset_name in ["Lung", "Soft Tissue", "Bone", "Brain"]:
+                    ui.button(
+                        preset_name,
+                        on_click=lambda name=preset_name: apply_window_preset(name),
+                    ).props("dense")
+            window_center_input = ui.number("Window Center", value=40).classes("w-full")
+            window_width_input = ui.number("Window Width", value=400, min=1).classes("w-full")
+            ui.button("Apply Custom Window", on_click=apply_custom_window).classes("w-full")
 
         # View tools
-        ui.label(
-            "View Tools"
-        ).classes(
-            "text-lg font-semibold"
-        )
+        with ui.expansion("View Tools", icon="zoom_in").classes("w-full"):
+            with ui.row().classes("w-full justify-between"):
+                zoom_label = ui.label("Zoom: 100%").classes("text-xs")
+                rotation_label = ui.label("Rotation: 0°").classes("text-xs")
+            with ui.row().classes("w-full gap-1"):
+                ui.button("Zoom In", on_click=zoom_in).props("dense").classes("flex-1")
+                ui.button("Zoom Out", on_click=zoom_out).props("dense").classes("flex-1")
+            with ui.row().classes("w-full gap-1"):
+                ui.button("Rotate Left", on_click=rotate_left).props("dense").classes("flex-1")
+                ui.button("Rotate Right", on_click=rotate_right).props("dense").classes("flex-1")
+            with ui.row().classes("w-full gap-1"):
+                ui.button("Flip H", on_click=toggle_flip_horizontal).props("dense").classes("flex-1")
+                ui.button("Flip V", on_click=toggle_flip_vertical).props("dense").classes("flex-1")
+            with ui.row().classes("w-full gap-1"):
+                ui.button("Fit", on_click=fit_to_screen).props("dense").classes("flex-1")
+                ui.button("Full Screen", on_click=enter_fullscreen).props("dense").classes("flex-1")
+                ui.button("Save", on_click=save_screenshot).props("dense").classes("flex-1")
 
-        zoom_label = ui.label(
-            "Zoom: 100%"
-        )
+            brightness_label = ui.label("Brightness: 0").classes("text-xs")
+            brightness_slider = ui.slider(
+                min=-100, max=100, value=0, step=1, on_change=change_brightness
+            ).classes("w-full")
+            contrast_label = ui.label("Contrast: 1.00").classes("text-xs")
+            contrast_slider = ui.slider(
+                min=0.25, max=3.0, value=1.0, step=0.05, on_change=change_contrast
+            ).classes("w-full")
+            ui.button("Reset Controls", on_click=reset_controls).props("dense").classes("w-full")
 
-        rotation_label = ui.label(
-            "Rotation: 0°"
-        )
-
-        with ui.row().classes(
-            "w-full gap-2"
-        ):
+        # Measurement / DICOM tools
+        with ui.expansion("Measurement / Analysis", icon="straighten").classes("w-full"):
+            measurement_mode_label = ui.label("Measurement Mode: OFF").classes("text-xs")
             ui.button(
-                "Zoom In",
-                on_click=zoom_in,
-            )
+                "Toggle Measurement", icon="straighten", on_click=toggle_measurement_mode
+            ).props("dense").classes("w-full")
+            measurement_result_label = ui.label("No measurement").classes("text-xs break-words")
+            ui.button("Clear Measurement", on_click=clear_measurement).props("dense outline").classes("w-full")
 
+            ui.separator()
+            hu_probe_mode_label = ui.label("HU Probe: OFF").classes("text-xs")
             ui.button(
-                "Zoom Out",
-                on_click=zoom_out,
-            )
+                "Toggle HU Probe", icon="my_location", on_click=toggle_hu_probe_mode
+            ).props("dense").classes("w-full")
+            hu_probe_result_label = ui.label(
+                "Click a CT pixel to read its HU value."
+            ).classes("text-xs break-words")
 
-        with ui.row().classes(
-            "w-full gap-2"
-        ):
+            roi_mode_label = ui.label("ROI Mode: OFF").classes("text-xs")
             ui.button(
-                "Rotate Left",
-                on_click=rotate_left,
-            )
-
+                "Toggle ROI Mode", icon="crop_square", on_click=toggle_roi_mode
+            ).props("dense").classes("w-full")
+            roi_result_label = ui.label("No ROI selected").classes("text-xs break-words")
             ui.button(
-                "Rotate Right",
-                on_click=rotate_right,
-            )
-
-        with ui.row().classes(
-            "w-full gap-2"
-        ):
-            ui.button(
-                "Flip H",
-                on_click=toggle_flip_horizontal,
-            )
-
-            ui.button(
-                "Flip V",
-                on_click=toggle_flip_vertical,
-            )
-
-        ui.button(
-            "Fit to Screen",
-            on_click=fit_to_screen,
-        ).classes(
-            "w-full"
-        )
-
-        ui.button(
-            "Full Screen",
-            on_click=enter_fullscreen,
-        ).classes(
-            "w-full"
-        )
-
-        ui.button(
-            "Save Image",
-            on_click=save_screenshot,
-        ).classes(
-            "w-full"
-        )
-
-        ui.separator()
-
-        brightness_label = ui.label(
-            "Brightness: 0"
-        )
-
-        brightness_slider = ui.slider(
-            min=-100,
-            max=100,
-            value=0,
-            step=1,
-            on_change=change_brightness,
-        ).classes(
-            "w-full"
-        )
-
-        contrast_label = ui.label(
-            "Contrast: 1.00"
-        )
-
-        contrast_slider = ui.slider(
-            min=0.25,
-            max=3.0,
-            value=1.0,
-            step=0.05,
-            on_change=change_contrast,
-        ).classes(
-            "w-full"
-        )
-
-        ui.button(
-            "Reset Controls",
-            on_click=reset_controls,
-        ).classes(
-            "w-full"
-        )
-
-        ui.separator()
-
-        # Measurements
-        ui.label(
-            "Measurement"
-        ).classes(
-            "text-lg font-semibold"
-        )
-
-        measurement_mode_label = ui.label(
-            "Measurement Mode: OFF"
-        )
-
-        ui.button(
-            "Toggle Measurement Mode",
-            icon="straighten",
-            on_click=toggle_measurement_mode,
-        ).classes(
-            "w-full"
-        )
-
-        measurement_result_label = ui.label(
-            "No measurement"
-        )
-
-        ui.button(
-            "Clear Measurement",
-            on_click=clear_measurement,
-        ).classes(
-            "w-full"
-        )
-
-        ui.separator()
-        ui.label("DICOM Analysis Tools").classes("text-lg font-semibold")
-
-        hu_probe_mode_label = ui.label("HU Probe: OFF")
-        ui.button(
-            "Toggle HU Probe",
-            icon="my_location",
-            on_click=toggle_hu_probe_mode,
-        ).classes("w-full")
-        hu_probe_result_label = ui.label(
-            "Click a CT pixel to read its HU value."
-        ).classes("text-sm")
-
-        roi_mode_label = ui.label("ROI Mode: OFF")
-        ui.button(
-            "Toggle ROI Mode",
-            icon="crop_square",
-            on_click=toggle_roi_mode,
-        ).classes("w-full")
-        roi_result_label = ui.label("No ROI selected").classes("text-sm break-words")
-
-        ui.button(
-            "Clear Analysis Overlay",
-            icon="layers_clear",
-            on_click=clear_analysis_overlay,
-        ).props("outline").classes("w-full")
+                "Clear Analysis Overlay", icon="layers_clear", on_click=clear_analysis_overlay
+            ).props("dense outline").classes("w-full")
 
 
     # CENTER
@@ -2648,12 +4226,14 @@ with ui.row().classes(
         with ui.expansion(
             "MRI Acquisition Details",
             icon="settings_input_component",
-        ).classes("w-full"):
+        ).classes("w-full") as mri_acquisition_panel:
             sequence_name_label = ui.label("Sequence Name: Not available")
             repetition_time_label = ui.label("TR: Not available")
             echo_time_label = ui.label("TE: Not available")
             flip_angle_label = ui.label("Flip Angle: Not available")
             field_strength_label = ui.label("Magnetic Field Strength: Not available")
+
+        mri_acquisition_panel.set_visibility(False)
 
         ui.separator()
 
@@ -2697,20 +4277,67 @@ with ui.row().classes(
             "w-full gap-2 rounded-lg border border-slate-300 bg-white p-3"
         ) as ct_analysis_panel:
             ui.label("CT Image Analysis").classes("text-xl font-semibold")
-            ui.label("Experimental COVID-CT EfficientNetB0 classifier").classes("text-sm text-gray-600")
-            ct_status_label = ui.label("Status: Load a CT PNG/JPG image.").classes("text-sm")
-            ct_analysis_button = ui.button("Run CT Classification", icon="analytics", on_click=run_ct_classification).classes("w-full")
+            ui.label(
+                "Experimental COVID-CT classification + U-Net infection localization"
+            ).classes("text-sm text-gray-600")
+
+            ct_status_label = ui.label(
+                "Status: Load a CT PNG/JPG or DICOM image."
+            ).classes("text-sm")
+
+            ct_analysis_button = ui.button(
+                "Run CT Analysis",
+                icon="analytics",
+                on_click=run_ct_classification,
+            ).classes("w-full")
             ct_analysis_button.disable()
+
+            ui.label("Classification").classes("font-semibold text-base")
             ct_prediction_label = ui.label("Prediction: Not run").classes("font-semibold")
             ct_noncovid_label = ui.label("NonCOVID probability: --")
-            ct_noncovid_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
+            ct_noncovid_progress = ui.linear_progress(
+                value=0.0, show_value=False
+            ).classes("w-full")
             ct_covid_label = ui.label("COVID probability: --")
-            ct_covid_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
+            ct_covid_progress = ui.linear_progress(
+                value=0.0, show_value=False
+            ).classes("w-full")
             ct_confidence_label = ui.label("Model confidence: --")
-            ct_confidence_level_label = ui.label("Confidence level: --").classes("font-medium")
-            ct_threshold_label = ui.label("Decision threshold: 0.46").classes("text-sm text-gray-600")
-            ui.button("Reset CT Analysis", icon="restart_alt", on_click=reset_ct_result).props("outline").classes("w-full")
-            ui.label("Research/demo output only. COVID-CT image classification is not for clinical diagnosis.").classes("text-xs text-gray-500")
+            ct_confidence_level_label = ui.label(
+                "Confidence level: --"
+            ).classes("font-medium")
+            ct_threshold_label = ui.label(
+                "Decision threshold: 0.46"
+            ).classes("text-sm text-gray-600")
+
+            ui.separator()
+            ui.label("Predicted Infection Localization").classes(
+                "font-semibold text-base"
+            )
+            ct_localization_status_label = ui.label(
+                "Infection localization: Not run"
+            )
+            ct_localization_coverage_label = ui.label(
+                "Predicted infection coverage: --"
+            )
+            ct_localization_probability_label = ui.label(
+                "Mean segmentation probability: --"
+            )
+            ct_localization_bbox_label = ui.label("Bounding box: --")
+
+            ui.button(
+                "Reset CT Analysis",
+                icon="restart_alt",
+                on_click=reset_ct_analysis,
+            ).props("outline").classes("w-full")
+
+
+
+            ui.separator()
+
+            ui.label(
+                "Research/demo output only. This CT analysis is not for clinical diagnosis."
+            ).classes("text-xs text-gray-500")
 
         ct_analysis_panel.set_visibility(False)
 
@@ -2718,10 +4345,22 @@ with ui.row().classes(
             "w-full gap-2 rounded-lg border border-slate-300 bg-white p-3"
         ) as mri_analysis_panel:
             ui.label("Brain MRI Analysis").classes("text-xl font-semibold")
-            ui.label("Experimental EfficientNetB0 3-class classifier").classes("text-sm text-gray-600")
-            mri_status_label = ui.label("Status: Load a brain MRI PNG/JPG image.").classes("text-sm")
-            mri_analysis_button = ui.button("Run MRI Classification", icon="analytics", on_click=run_mri_classification).classes("w-full")
+            ui.label(
+                "Experimental tumor-type classification + U-Net tumor localization"
+            ).classes("text-sm text-gray-600")
+
+            mri_status_label = ui.label(
+                "Status: Load a brain MRI PNG/JPG image."
+            ).classes("text-sm")
+
+            mri_analysis_button = ui.button(
+                "Run MRI Analysis",
+                icon="analytics",
+                on_click=run_mri_classification,
+            ).classes("w-full")
             mri_analysis_button.disable()
+
+            ui.label("Classification").classes("font-semibold text-base")
             mri_prediction_label = ui.label("Prediction: Not run").classes("font-semibold")
             mri_meningioma_label = ui.label("Meningioma probability: --")
             mri_meningioma_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
@@ -2731,8 +4370,36 @@ with ui.row().classes(
             mri_pituitary_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
             mri_confidence_label = ui.label("Model confidence: --")
             mri_confidence_level_label = ui.label("Confidence level: --").classes("font-medium")
-            ui.button("Reset MRI Analysis", icon="restart_alt", on_click=reset_mri_result).props("outline").classes("w-full")
-            ui.label("Research/demo output only. This brain MRI classifier is not for clinical diagnosis.").classes("text-xs text-gray-500")
+
+            ui.separator()
+            ui.label("Predicted Tumor Localization").classes("font-semibold text-base")
+            mri_localization_status_label = ui.label(
+                "Tumor localization: Not run"
+            ).classes("text-sm")
+            mri_localization_coverage_label = ui.label(
+                "Predicted region coverage: --"
+            ).classes("text-sm")
+            mri_localization_probability_label = ui.label(
+                "Mean segmentation probability: --"
+            ).classes("text-sm")
+            mri_localization_bbox_label = ui.label(
+                "Bounding box: --"
+            ).classes("text-sm")
+
+            # Hidden compatibility element; localization now appears in the main viewer.
+            mri_localization_image = ui.image().classes("hidden")
+            mri_localization_image.set_visibility(False)
+
+
+            ui.button(
+                "Reset MRI Analysis",
+                icon="restart_alt",
+                on_click=reset_mri_analysis,
+            ).props("outline").classes("w-full")
+
+            ui.label(
+                "Research/demo output only. This brain MRI analysis is not for clinical diagnosis."
+            ).classes("text-xs text-gray-500")
 
         mri_analysis_panel.set_visibility(False)
 
@@ -2766,9 +4433,9 @@ with ui.row().classes(
             )
 
             classification_button = ui.button(
-                "Run Classification",
+                "Run Ultrasound Analysis",
                 icon="analytics",
-                on_click=run_ultrasound_classification,
+                on_click=run_ultrasound_analysis,
             ).classes(
                 "w-full"
             )
