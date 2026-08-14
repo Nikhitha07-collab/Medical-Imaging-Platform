@@ -2896,7 +2896,10 @@ def update_classification_availability() -> None:
 
     is_supported = (
         current_modality == "Ultrasound"
-        and current_file_type == "PNG/JPG"
+        and current_file_type in {
+            "PNG/JPG",
+            "DICOM",
+        }
     )
     classification_panel.set_visibility(is_supported)
 
@@ -2909,9 +2912,12 @@ def update_classification_availability() -> None:
         classification_button.disable()
         return
 
-    if current_file_type != "PNG/JPG":
+    if current_file_type not in {
+        "PNG/JPG",
+        "DICOM",
+    }:
         classification_status_label.set_text(
-            "Status: Classifier currently supports thyroid ultrasound PNG/JPG images only."
+            "Status: Classifier supports thyroid ultrasound PNG/JPG or DICOM images."
         )
         confirm_thyroid_checkbox.value = False
         confirm_thyroid_checkbox.update()
@@ -2929,7 +2935,13 @@ def update_classification_availability() -> None:
 
 
 def handle_thyroid_confirmation(event) -> None:
-    if current_modality != "Ultrasound" or current_file_type != "PNG/JPG":
+    if (
+        current_modality != "Ultrasound"
+        or current_file_type not in {
+            "PNG/JPG",
+            "DICOM",
+        }
+    ):
         classification_button.disable()
         return
 
@@ -2955,9 +2967,12 @@ def run_ultrasound_classification() -> None:
         )
         return
 
-    if current_file_type != "PNG/JPG":
+    if current_file_type not in {
+        "PNG/JPG",
+        "DICOM",
+    }:
         ui.notify(
-            "Load a thyroid ultrasound PNG/JPG image before classification.",
+            "Load a thyroid ultrasound PNG/JPG or DICOM image before classification.",
             type="warning",
         )
         return
@@ -2978,6 +2993,53 @@ def run_ultrasound_classification() -> None:
 
     selected_file = current_files[current_slice_index]
 
+
+    temporary_us_png = None
+    model_input = selected_file
+
+    # --------------------------------------------------------
+    # ULTRASOUND CLASSIFIER DICOM PREPARATION
+    # --------------------------------------------------------
+
+    if current_file_type == "DICOM":
+
+        # Confirm this is appropriate thyroid ultrasound data.
+        anatomy_check = _ultrasound_dicom_is_thyroid(
+            selected_file
+        )
+
+        if not anatomy_check["supported"]:
+
+            classification_status_label.set_text(
+                "Status: Thyroid ultrasound AI "
+                "not applicable to this DICOM."
+            )
+
+            classification_prediction_label.set_text(
+                "Prediction: Not run"
+            )
+
+            ui.notify(
+                anatomy_check["reason"],
+                type="warning",
+                position="top",
+            )
+
+            return
+
+        bridge_result = dicom_to_temporary_png(
+            dicom_path=selected_file,
+            frame_index=0,
+            modality_override="US",
+        )
+
+        temporary_us_png = bridge_result[
+            "temporary_png"
+        ]
+
+        model_input = temporary_us_png
+
+
     try:
         classification_status_label.set_text(
             "Status: Running classification..."
@@ -2985,7 +3047,7 @@ def run_ultrasound_classification() -> None:
         classification_button.disable()
 
         result = ultrasound_classifier.predict(
-            selected_file
+            model_input
         )
 
         classification_prediction_label.set_text(
@@ -3061,6 +3123,11 @@ def run_ultrasound_classification() -> None:
         )
 
     finally:
+        if temporary_us_png is not None:
+            cleanup_temporary_ai_image(
+                temporary_us_png
+            )
+
         if bool(confirm_thyroid_checkbox.value):
             classification_button.enable()
 
@@ -3097,7 +3164,10 @@ def reset_ultrasound_localization() -> None:
 
         if (
             current_modality == "Ultrasound"
-            and current_file_type == "PNG/JPG"
+            and current_file_type in {
+                "PNG/JPG",
+                "DICOM",
+            }
             and current_files
         ):
             load_current_image(
@@ -3110,6 +3180,125 @@ def reset_ultrasound_localization() -> None:
             type="negative",
             position="top",
         )
+
+
+
+
+def _ultrasound_dicom_is_thyroid(dicom_path):
+    """
+    Research/demo safety gate for the thyroid ultrasound models.
+    """
+
+    try:
+        import pydicom
+
+        dataset = pydicom.dcmread(
+            str(dicom_path),
+            stop_before_pixels=True,
+            force=True,
+        )
+
+    except Exception as error:
+
+        return {
+            "supported": False,
+            "reason": (
+                "Unable to inspect ultrasound DICOM metadata: "
+                f"{error}"
+            ),
+        }
+
+    modality = str(
+        getattr(
+            dataset,
+            "Modality",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    body_part = str(
+        getattr(
+            dataset,
+            "BodyPartExamined",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    study = str(
+        getattr(
+            dataset,
+            "StudyDescription",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    series = str(
+        getattr(
+            dataset,
+            "SeriesDescription",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    protocol = str(
+        getattr(
+            dataset,
+            "ProtocolName",
+            "",
+        )
+        or ""
+    ).strip().upper()
+
+    metadata = " ".join(
+        [
+            body_part,
+            study,
+            series,
+            protocol,
+        ]
+    )
+
+    if modality not in {
+        "US",
+        "ULTRASOUND",
+    }:
+
+        return {
+            "supported": False,
+            "reason": (
+                f"DICOM modality is {modality}, not ultrasound."
+            ),
+        }
+
+    thyroid_terms = [
+        "THYROID",
+        "NECK",
+    ]
+
+    for term in thyroid_terms:
+
+        if term in metadata:
+
+            return {
+                "supported": True,
+                "reason": (
+                    "Thyroid ultrasound identified "
+                    f"from DICOM metadata ({term})."
+                ),
+            }
+
+    return {
+        "supported": False,
+        "reason": (
+            "Thyroid ultrasound anatomy could not be "
+            "confirmed from this DICOM. "
+            "Thyroid AI was not run."
+        ),
+    }
 
 
 def run_ultrasound_analysis() -> None:
@@ -3125,9 +3314,12 @@ def run_ultrasound_analysis() -> None:
         )
         return
 
-    if current_file_type != "PNG/JPG":
+    if current_file_type not in {
+        "PNG/JPG",
+        "DICOM",
+    }:
         ui.notify(
-            "Load a thyroid ultrasound PNG/JPG image first.",
+            "Load a thyroid ultrasound PNG/JPG or DICOM image first.",
             type="warning",
         )
         return
@@ -3150,6 +3342,67 @@ def run_ultrasound_analysis() -> None:
         current_slice_index
     ]
 
+
+    temporary_us_png = None
+    model_input = selected_file
+
+    # --------------------------------------------------------
+    # ULTRASOUND DICOM THYROID GATE
+    # --------------------------------------------------------
+
+    if current_file_type == "DICOM":
+
+        anatomy_check = (
+            _ultrasound_dicom_is_thyroid(
+                selected_file
+            )
+        )
+
+        if not anatomy_check["supported"]:
+
+            classification_status_label.set_text(
+                "Status: Thyroid ultrasound AI "
+                "not applicable to this DICOM."
+            )
+
+            classification_prediction_label.set_text(
+                "Prediction: Not run"
+            )
+
+            ultrasound_localization_status_label.set_text(
+                "Lesion localization: Not run"
+            )
+
+            viewer_status_label.set_text(
+                "Ultrasound AI blocked: "
+                + anatomy_check["reason"]
+            )
+
+            ui.notify(
+                anatomy_check["reason"],
+                type="warning",
+                position="top",
+            )
+
+            return
+
+        bridge_result = dicom_to_temporary_png(
+            dicom_path=selected_file,
+            frame_index=0,
+            modality_override="US",
+        )
+
+        temporary_us_png = (
+            bridge_result[
+                "temporary_png"
+            ]
+        )
+
+        model_input = (
+            temporary_us_png
+        )
+
+
     # ========================================================
     # EXISTING CLASSIFICATION
     # ========================================================
@@ -3169,7 +3422,7 @@ def run_ultrasound_analysis() -> None:
         classification_button.disable()
 
         localization = ultrasound_yolo_detector.predict(
-            selected_file,
+            model_input,
             confidence_threshold=0.25,
         )
 
@@ -3213,7 +3466,7 @@ def run_ultrasound_analysis() -> None:
             # =================================================
 
             original_image = Image.open(
-                selected_file
+                model_input
             ).convert(
                 "RGB"
             )
@@ -3409,6 +3662,11 @@ def run_ultrasound_analysis() -> None:
         )
 
     finally:
+
+        if temporary_us_png is not None:
+            cleanup_temporary_ai_image(
+                temporary_us_png
+            )
 
         if bool(confirm_thyroid_checkbox.value):
             classification_button.enable()
@@ -4492,11 +4750,55 @@ with ui.row().classes(
                 "text-sm text-gray-600"
             )
 
+
+            # =================================================
+            # YOLO LESION LOCALIZATION RESULTS
+            # =================================================
+
+            ui.separator()
+
+            ui.label(
+                "Predicted Lesion Localization"
+            ).classes(
+                "font-semibold"
+            )
+
+            ultrasound_localization_status_label = ui.label(
+                "Lesion localization: Not run"
+            ).classes(
+                "text-sm"
+            )
+
+            ultrasound_localization_confidence_label = ui.label(
+                "YOLO detection confidence: --"
+            ).classes(
+                "text-sm"
+            )
+
+            ultrasound_localization_bbox_label = ui.label(
+                "Bounding box: --"
+            ).classes(
+                "text-sm break-words"
+            )
+
+            ultrasound_localization_coverage_label = ui.label(
+                "Predicted lesion coverage: --"
+            ).classes(
+                "text-sm"
+            )
+
+            ultrasound_detection_count_label = ui.label(
+                "YOLO detections: --"
+            ).classes(
+                "text-sm"
+            )
+
             ui.button(
                 "Reset Analysis",
                 icon="restart_alt",
                 on_click=lambda: (
                     reset_classification_result(),
+                    reset_ultrasound_localization(),
                     classification_status_label.set_text(
                         "Status: Ready for classification."
                     )
