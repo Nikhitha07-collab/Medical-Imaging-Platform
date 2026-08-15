@@ -70,3 +70,17 @@ app_*_backup.py
 # Generated training results
 training/**/results/
 training/**/threshold_analysis/
+# Generated AI training and evaluation outputs
+runs/
+training/ct_dicom_ai_test/
+training/ct_segmentation/localization_test/
+training/ct_segmentation/results_v2/
+training/dicom_ai_bridge_test/
+training/mri_dicom_ai_test/
+training/mri_segmentation/evaluation/
+training/mri_segmentation/figshare_results/
+training/mri_segmentation/localization_test/
+training/mri_segmentation/platform_compatibility_test/
+training/ultrasound_segmentation/localization_test/
+training/ultrasound_segmentation/results_v2/
+training/ultrasound_segmentation/yolo_test/
