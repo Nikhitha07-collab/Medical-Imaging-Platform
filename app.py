@@ -1,4 +1,5 @@
 import os
+
 from base64 import b64encode
 from io import BytesIO
 from pathlib import Path
@@ -8,17 +9,11 @@ from nicegui import events, ui
 from PIL import Image
 import numpy as np
 
-from ai.ct_classifier import CTClassifier
 from ai.ct_lung_gate import check_ct_lung_content
 from ai.dicom_ai_bridge import (
     cleanup_temporary_ai_image,
     dicom_to_temporary_png,
 )
-from ai.ct_segmenter import segment_ct
-from ai.mri_classifier import MRIClassifier
-from ai.mri_segmenter import segment_mri
-from ai.ultrasound_classifier import UltrasoundClassifier
-from ai.ultrasound_yolo_detector import UltrasoundYOLODetector
 from utils.dicom_loader import load_dicom
 from utils.image_loader import load_standard_image
 from utils.measurements import (
@@ -83,10 +78,58 @@ roi_mode = False
 roi_points: list[tuple[float, float]] = []
 saved_annotations: list[str] = []
 
-ct_classifier = CTClassifier()
-mri_classifier = MRIClassifier()
-ultrasound_classifier = UltrasoundClassifier()
-ultrasound_yolo_detector = UltrasoundYOLODetector()
+_ct_classifier = None
+_mri_classifier = None
+_ultrasound_classifier = None
+_ultrasound_yolo_detector = None
+
+
+def get_ct_classifier():
+    """Load the CT classifier only when CT analysis is requested."""
+    global _ct_classifier
+    if _ct_classifier is None:
+        from ai.ct_classifier import CTClassifier
+        _ct_classifier = CTClassifier()
+    return _ct_classifier
+
+
+def get_mri_classifier():
+    """Load the MRI classifier only when MRI analysis is requested."""
+    global _mri_classifier
+    if _mri_classifier is None:
+        from ai.mri_classifier import MRIClassifier
+        _mri_classifier = MRIClassifier()
+    return _mri_classifier
+
+
+def get_ultrasound_classifier():
+    """Load the ultrasound classifier only when ultrasound analysis is requested."""
+    global _ultrasound_classifier
+    if _ultrasound_classifier is None:
+        from ai.ultrasound_classifier import UltrasoundClassifier
+        _ultrasound_classifier = UltrasoundClassifier()
+    return _ultrasound_classifier
+
+
+def get_ultrasound_yolo_detector():
+    """Load YOLO only when ultrasound localization is requested."""
+    global _ultrasound_yolo_detector
+    if _ultrasound_yolo_detector is None:
+        from ai.ultrasound_yolo_detector import UltrasoundYOLODetector
+        _ultrasound_yolo_detector = UltrasoundYOLODetector()
+    return _ultrasound_yolo_detector
+
+
+def run_ct_segmentation(*args, **kwargs):
+    """Import and run the CT segmenter only when needed."""
+    from ai.ct_segmenter import segment_ct
+    return run_ct_segmentation(*args, **kwargs)
+
+
+def run_mri_segmentation(*args, **kwargs):
+    """Import and run the MRI segmenter only when needed."""
+    from ai.mri_segmenter import segment_mri
+    return run_mri_segmentation(*args, **kwargs)
 
 
 def image_to_data_url(image_array) -> str:
@@ -1982,7 +2025,7 @@ def run_ct_classification() -> None:
         )
 
 
-        result = ct_classifier.predict(
+        result = get_ct_classifier().predict(
             model_input
         )
 
@@ -2060,7 +2103,7 @@ def run_ct_classification() -> None:
         )
 
 
-        localization = segment_ct(
+        localization = run_ct_segmentation(
             model_input
         )
 
@@ -2594,7 +2637,7 @@ def run_mri_classification() -> None:
         # CLASSIFICATION
         # ====================================================
 
-        result = mri_classifier.predict(
+        result = get_mri_classifier().predict(
             model_input
         )
 
@@ -2688,7 +2731,7 @@ def run_mri_classification() -> None:
 
         try:
 
-            localization = segment_mri(
+            localization = run_mri_segmentation(
                 model_input
             )
 
@@ -3047,7 +3090,7 @@ def run_ultrasound_classification() -> None:
         )
         classification_button.disable()
 
-        result = ultrasound_classifier.predict(
+        result = get_ultrasound_classifier().predict(
             model_input
         )
 
@@ -3422,7 +3465,7 @@ def run_ultrasound_analysis() -> None:
 
         classification_button.disable()
 
-        localization = ultrasound_yolo_detector.predict(
+        localization = get_ultrasound_yolo_detector().predict(
             model_input,
             confidence_threshold=0.25,
         )
