@@ -1,79 +1,159 @@
-# Virtual environment
+# =========================================================
+# PYTHON ENVIRONMENT
+# =========================================================
+
 .venv/
 venv/
 
-# Python cache files
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Environment and secret files
+
+# =========================================================
+# ENVIRONMENT / SECRET FILES
+# =========================================================
+
 .env
 .env.*
 secrets.toml
-
-# Streamlit local configuration
 .streamlit/secrets.toml
 
-# DICOM and local test data
+
+# =========================================================
+# LOCAL MEDICAL DATA
+# Never upload patient/test DICOM data
+# =========================================================
+
 test_data/
+uploaded_data/
+training_data/
+
 *.dcm
 *.dicom
 
-# Large model files
 
-# Notebook checkpoints
+# =========================================================
+# NOTEBOOK / TEST OUTPUT
+# =========================================================
+
 .ipynb_checkpoints/
-
-# Test and coverage output
 .pytest_cache/
 .coverage
 htmlcov/
 
-# IDE files
+
+# =========================================================
+# IDE FILES
+# =========================================================
+
 .vscode/
 .idea/
 
-# Operating-system files
+
+# =========================================================
+# OPERATING SYSTEM FILES
+# =========================================================
+
 .DS_Store
 Thumbs.db
 
-# Temporary and log files
+
+# =========================================================
+# TEMPORARY / LOG FILES
+# =========================================================
+
 *.log
 *.tmp
-# Temporary uploaded medical images
-uploaded_data/
-# Local training datasets
-training_data/
 
-# Local backup files
+
+# =========================================================
+# LOCAL BACKUP FILES
+# =========================================================
+
 app_before_classifier.py
-# Local training datasets
-training_data/
-
-# Trained model files
-
-# Local sample DICOM data
-test_data/
-
-# Temporary backup app files
 app_before_*.py
 app_*_backup.py
 
-# Generated training results
+
+# =========================================================
+# GENERATED TRAINING / EVALUATION OUTPUT
+# =========================================================
+
+runs/
+
 training/**/results/
 training/**/threshold_analysis/
-# Generated AI training and evaluation outputs
-runs/
+
 training/ct_dicom_ai_test/
 training/ct_segmentation/localization_test/
 training/ct_segmentation/results_v2/
+
 training/dicom_ai_bridge_test/
+
 training/mri_dicom_ai_test/
 training/mri_segmentation/evaluation/
 training/mri_segmentation/figshare_results/
 training/mri_segmentation/localization_test/
 training/mri_segmentation/platform_compatibility_test/
+
 training/ultrasound_segmentation/localization_test/
 training/ultrasound_segmentation/results_v2/
 training/ultrasound_segmentation/yolo_test/
+
+
+# =========================================================
+# EXTRA CT MODELS - NOT REQUIRED BY DEPLOYED APP
+# =========================================================
+
+models/ct/covid_ct_classifier_final.keras
+models/ct/ct_infection_segmenter_best.keras
+models/ct/ct_infection_segmenter_final.keras
+models/ct/ct_infection_segmenter_v2_final.keras
+
+
+# =========================================================
+# EXTRA MRI MODELS - NOT REQUIRED BY DEPLOYED APP
+# =========================================================
+
+models/mri/brain_mri_classifier_final.keras
+models/mri/brain_tumor_segmenter_best.keras
+models/mri/brain_tumor_segmenter_final.keras
+models/mri/figshare_mri_segmenter_final.keras
+
+
+# =========================================================
+# EXTRA ULTRASOUND MODELS - NOT REQUIRED BY DEPLOYED APP
+# =========================================================
+
+models/ultrasound/tn5000_classifier_final.keras
+models/ultrasound/tn5000_classifier_v2_best.keras
+models/ultrasound/tn5000_classifier_v2_final.keras
+models/ultrasound/tn5000_localizer_best.keras
+models/ultrasound/tn5000_localizer_final.keras
+models/ultrasound/tn5000_localizer_v2_best.keras
+models/ultrasound/tn5000_localizer_v2_final.keras
+
+
+# =========================================================
+# DOWNLOADED YOLO BASE MODELS - LOCAL ONLY
+# =========================================================
+
+/yolo11n.pt
+/yolo26n.pt
+
+
+# =========================================================
+# IMPORTANT:
+# DO NOT IGNORE THE FOLLOWING DEPLOYMENT MODELS
+#
+# models/ct/covid_ct_classifier_best.keras
+# models/ct/ct_infection_segmenter_v2_best.keras
+# models/mri/brain_mri_classifier_best.keras
+# models/mri/figshare_mri_segmenter_best.keras
+# models/ultrasound/tn5000_classifier_best.keras
+# models/ultrasound/tn5000_yolo11n_best.pt
+#
+# These files are required by the deployed application.
+# =========================================================
