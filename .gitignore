@@ -21,12 +21,6 @@ test_data/
 *.dicom
 
 # Large model files
-*.h5
-*.keras
-*.pt
-*.pth
-*.onnx
-*.ckpt
 
 # Notebook checkpoints
 .ipynb_checkpoints/
@@ -58,7 +52,6 @@ app_before_classifier.py
 training_data/
 
 # Trained model files
-models/
 
 # Local sample DICOM data
 test_data/

@@ -1,3 +1,4 @@
+import os
 from base64 import b64encode
 from io import BytesIO
 from pathlib import Path
@@ -4855,8 +4856,10 @@ if sample_files:
     )
 
 
-ui.run(
-    title=PROJECT_TITLE,
-    port=8090,
-    reload=True,
-)
+if __name__ in {"__main__", "__mp_main__"}:
+    ui.run(
+        title=PROJECT_TITLE,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8090)),
+        reload=False,
+    )
