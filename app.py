@@ -35,6 +35,11 @@ from utils.upload_handler import (
 
 PROJECT_TITLE = "Medical Imaging Platform"
 
+PORTFOLIO_VIEWER_ONLY = (
+    os.environ.get("PORTFOLIO_VIEWER_ONLY", "0") == "1"
+)
+
+
 
 MODALITY_FOLDERS = {
     "CT": Path("test_data/CT/chest_ct/27548"),
@@ -85,7 +90,6 @@ _ultrasound_yolo_detector = None
 
 
 def get_ct_classifier():
-    """Load the CT classifier only when CT analysis is requested."""
     global _ct_classifier
     if _ct_classifier is None:
         from ai.ct_classifier import CTClassifier
@@ -94,7 +98,6 @@ def get_ct_classifier():
 
 
 def get_mri_classifier():
-    """Load the MRI classifier only when MRI analysis is requested."""
     global _mri_classifier
     if _mri_classifier is None:
         from ai.mri_classifier import MRIClassifier
@@ -103,7 +106,6 @@ def get_mri_classifier():
 
 
 def get_ultrasound_classifier():
-    """Load the ultrasound classifier only when ultrasound analysis is requested."""
     global _ultrasound_classifier
     if _ultrasound_classifier is None:
         from ai.ultrasound_classifier import UltrasoundClassifier
@@ -112,7 +114,6 @@ def get_ultrasound_classifier():
 
 
 def get_ultrasound_yolo_detector():
-    """Load YOLO only when ultrasound localization is requested."""
     global _ultrasound_yolo_detector
     if _ultrasound_yolo_detector is None:
         from ai.ultrasound_yolo_detector import UltrasoundYOLODetector
@@ -121,15 +122,13 @@ def get_ultrasound_yolo_detector():
 
 
 def run_ct_segmentation(*args, **kwargs):
-    """Import and run the CT segmenter only when needed."""
     from ai.ct_segmenter import segment_ct
-    return run_ct_segmentation(*args, **kwargs)
+    return segment_ct(*args, **kwargs)
 
 
 def run_mri_segmentation(*args, **kwargs):
-    """Import and run the MRI segmenter only when needed."""
     from ai.mri_segmenter import segment_mri
-    return run_mri_segmentation(*args, **kwargs)
+    return segment_mri(*args, **kwargs)
 
 
 def image_to_data_url(image_array) -> str:
@@ -1788,6 +1787,14 @@ def _ct_dicom_is_supported_anatomy(dicom_path):
 
 
 def run_ct_classification() -> None:
+    if PORTFOLIO_VIEWER_ONLY:
+        ui.notify(
+            "AI analysis is disabled in the free online demo. "
+            "CT viewing and DICOM tools remain available.",
+            type="info",
+            position="top",
+        )
+        return
     """
     Run CT classification and infection localization.
 
@@ -2435,6 +2442,14 @@ def _mri_dicom_is_brain_anatomy(dicom_path):
 
 
 def run_mri_classification() -> None:
+    if PORTFOLIO_VIEWER_ONLY:
+        ui.notify(
+            "AI analysis is disabled in the free online demo. "
+            "MRI viewing and DICOM tools remain available.",
+            type="info",
+            position="top",
+        )
+        return
     """
     Run brain MRI classification and tumor localization.
 
@@ -3346,6 +3361,14 @@ def _ultrasound_dicom_is_thyroid(dicom_path):
 
 
 def run_ultrasound_analysis() -> None:
+    if PORTFOLIO_VIEWER_ONLY:
+        ui.notify(
+            "AI analysis is disabled in the free online demo. "
+            "Ultrasound viewing and DICOM tools remain available.",
+            type="info",
+            position="top",
+        )
+        return
     """
     Run the existing TN5000 classifier and then
     YOLO thyroid-lesion localization.
@@ -4593,6 +4616,11 @@ with ui.row().classes(
                 on_click=run_ct_classification,
             ).classes("w-full")
             ct_analysis_button.disable()
+            if PORTFOLIO_VIEWER_ONLY:
+                ct_analysis_button.disable()
+                ct_status_label.set_text(
+                    "Online demo: CT viewer available. AI analysis runs locally."
+                )
 
             ui.label("Classification").classes("font-semibold text-base")
             ct_prediction_label = ui.label("Prediction: Not run").classes("font-semibold")
@@ -4661,6 +4689,11 @@ with ui.row().classes(
                 on_click=run_mri_classification,
             ).classes("w-full")
             mri_analysis_button.disable()
+            if PORTFOLIO_VIEWER_ONLY:
+                mri_analysis_button.disable()
+                mri_status_label.set_text(
+                    "Online demo: MRI viewer available. AI analysis runs locally."
+                )
 
             ui.label("Classification").classes("font-semibold text-base")
             mri_prediction_label = ui.label("Prediction: Not run").classes("font-semibold")
@@ -4743,6 +4776,11 @@ with ui.row().classes(
             )
 
             classification_button.disable()
+            if PORTFOLIO_VIEWER_ONLY:
+                classification_button.disable()
+                classification_status_label.set_text(
+                    "Online demo: Ultrasound viewer available. AI analysis runs locally."
+                )
 
             classification_prediction_label = ui.label(
                 "Prediction: Not run"
